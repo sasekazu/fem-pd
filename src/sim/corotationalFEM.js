@@ -23,7 +23,8 @@ export class CorotationalFEM extends SoftBodyBase {
     const N = 2 * this.n;
     this._rhs = new Float64Array(N);
     this._rhsBase = new Float64Array(N);
-    this._kC = new Float64Array(N);
+    this._kB = new Float64Array(3 * this.n); // contact stiffness 2x2 block per vertex: [xx, xy, yy]
+    this._xl = new Float64Array(N);
     this._dv = new Float64Array(N);
     this._tmp = new Float64Array(N);
     this._f = new Float64Array(N);
@@ -235,42 +236,55 @@ export class CorotationalFEM extends SoftBodyBase {
       rhsBase[2 * i + 1] = h * (f[2 * i + 1] + this.fext[2 * i + 1] - mass[i] * gravity) - h * h * Kv[2 * i + 1];
     }
     const h2 = h * h;
-    const kC = this._kC; // contact stiffness on the y-DOFs (diagonal)
+    const kB = this._kB; // contact stiffness: one symmetric 2x2 block k m n n^T per vertex (sum over colliders)
     const rhs = this._rhs;
     const diag = this._diag;
     const apply = (p, out) => {
       csrMul(rowPtr, colIdx, vals, p, out);
       for (let i = 0; i < n; i++) {
-        out[2 * i] = mass[i] * p[2 * i] + h2 * out[2 * i];
-        out[2 * i + 1] = (mass[i] + h2 * kC[2 * i + 1]) * p[2 * i + 1] + h2 * out[2 * i + 1];
+        const px = p[2 * i];
+        const py = p[2 * i + 1];
+        out[2 * i] = mass[i] * px + h2 * (out[2 * i] + kB[3 * i] * px + kB[3 * i + 1] * py);
+        out[2 * i + 1] = mass[i] * py + h2 * (out[2 * i + 1] + kB[3 * i + 1] * px + kB[3 * i + 2] * py);
       }
     };
 
-    // Floor contact: penalty force k m_i (floorY - y)_+ evaluated at the predicted end-of-step
-    // position x + h (v + dv) and linearised there (adds h^2 k m_i to the A diagonal of active
-    // vertices). The active set is re-checked after the solve (a few passes at most).
-    const { enabled, floorY, k } = this.contact;
+    // Contact (floor and rigid colliders): penalty force  f_i = -k m_i phi n  evaluated at the predicted
+    // end-of-step position x_l = x + h (v + dv) and linearised there with the Gauss-Newton block
+    // K_i = k m_i n n^T (adds h^2 K_i to the A diagonal blocks of the active vertices). The active set is
+    // re-checked after the solve (a few passes at most). The colliders' pose is the one at the end of the step.
+    const ct = this.contact;
+    const contactOn = ct.enabled;
     const dv = this._dv;
+    const xl = this._xl;
     dv.fill(0);
     let iters = 0;
-    const passes = enabled ? this.contactPasses : 1;
+    const passes = contactOn ? this.contactPasses : 1;
+    const predict = () => {
+      for (let i = 0; i < N; i++) xl[i] = x[i] + h * (v[i] + dv[i]);
+      return ct.collect(xl, n);
+    };
+    let cnt = contactOn ? predict() : 0;
     for (let pass = 0; pass < passes; pass++) {
-      kC.fill(0);
+      kB.fill(0);
       rhs.set(rhsBase);
-      if (enabled) {
-        for (let i = 0; i < n; i++) {
-          const yl = x[2 * i + 1] + h * (v[2 * i + 1] + dv[2 * i + 1]);
-          if (floorY - yl > 0) {
-            const ki = k * mass[i];
-            kC[2 * i + 1] = ki;
-            // h f_c(x_l) + h^2 K_c dv_l
-            rhs[2 * i + 1] += h * ki * (floorY - yl) + h2 * ki * dv[2 * i + 1];
-          }
-        }
+      for (let t = 0; t < cnt; t++) {
+        const i = ct.idx[t];
+        const nx = ct.nx[t];
+        const ny = ct.ny[t];
+        const ki = ct.k * mass[i];
+        kB[3 * i] += ki * nx * nx;
+        kB[3 * i + 1] += ki * nx * ny;
+        kB[3 * i + 2] += ki * ny * ny;
+        // h f_c(x_l) + h^2 K_c dv_l
+        const fc = -ki * ct.phi[t];
+        const ndv = nx * dv[2 * i] + ny * dv[2 * i + 1];
+        rhs[2 * i] += h * fc * nx + h2 * ki * nx * ndv;
+        rhs[2 * i + 1] += h * fc * ny + h2 * ki * ny * ndv;
       }
       for (let i = 0; i < n; i++) {
-        diag[2 * i] = mass[i] + h2 * kdiag[2 * i];
-        diag[2 * i + 1] = mass[i] + h2 * (kdiag[2 * i + 1] + kC[2 * i + 1]);
+        diag[2 * i] = mass[i] + h2 * (kdiag[2 * i] + kB[3 * i]);
+        diag[2 * i + 1] = mass[i] + h2 * (kdiag[2 * i + 1] + kB[3 * i + 2]);
       }
       iters += pcg({
         apply,
@@ -282,14 +296,11 @@ export class CorotationalFEM extends SoftBodyBase {
         maxIter: this.cg.maxIter,
         work: this._work,
       });
-      if (!enabled) break;
+      if (!contactOn) break;
       // did the active set at the new predicted position change?
-      let changed = false;
-      for (let i = 0; i < n; i++) {
-        const now = floorY - (x[2 * i + 1] + h * (v[2 * i + 1] + dv[2 * i + 1])) > 0 ? 1 : 0;
-        if ((kC[2 * i + 1] > 0 ? 1 : 0) !== now) changed = true;
-      }
-      if (!changed) break;
+      const used = ct.snapshot();
+      cnt = predict();
+      if (ct.sameActiveSet(used)) break;
     }
     for (let i = 0; i < N; i++) {
       v[i] += dv[i];

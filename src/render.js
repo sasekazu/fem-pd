@@ -25,7 +25,7 @@ function strainColor(t, out) {
   out.copy(tmp);
 }
 
-/** Draws one soft body (filled triangles coloured by strain + wireframe) and an optional floor. */
+/** Draws one soft body (filled triangles coloured by strain + wireframe), an optional floor and kinematic rigid bodies. */
 export class SoftBodyView {
   constructor(mesh, viewRect) {
     this.mesh = mesh;
@@ -86,6 +86,48 @@ export class SoftBodyView {
     );
     this.floor.add(slab, line);
     this.scene.add(this.floor);
+
+    // kinematic rigid bodies (Polygon colliders): one group per body, posed in update()
+    this.rigidGroup = new THREE.Group();
+    this.scene.add(this.rigidGroup);
+    this.rigid = [];
+  }
+
+  /** Show the given Polygon colliders (replaces the previous ones). Their pose is read every update(). */
+  setRigid(bodies) {
+    for (const r of this.rigid) {
+      this.rigidGroup.remove(r.group);
+      r.group.traverse((o) => {
+        o.geometry?.dispose();
+        o.material?.dispose();
+      });
+    }
+    this.rigid = bodies.map((body) => {
+      const v = body.vertices;
+      const shape = new THREE.Shape();
+      shape.moveTo(v[0], v[1]);
+      for (let i = 1; i < body.n; i++) shape.lineTo(v[2 * i], v[2 * i + 1]);
+      shape.closePath();
+      const fill = new THREE.Mesh(
+        new THREE.ShapeGeometry(shape),
+        new THREE.MeshBasicMaterial({ color: 0x66758f, transparent: true, opacity: 0.82, side: THREE.DoubleSide })
+      );
+      const pts = [];
+      for (let i = 0; i < body.n; i++) pts.push(new THREE.Vector3(v[2 * i], v[2 * i + 1], 0.001));
+      const outline = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xd3dcec }));
+      const group = new THREE.Group();
+      group.add(fill, outline);
+      this.rigidGroup.add(group);
+      return { body, group };
+    });
+    this.syncRigid();
+  }
+
+  syncRigid() {
+    for (const { body, group } of this.rigid) {
+      group.position.set(body.x, body.y, 0.015);
+      group.rotation.z = body.angle;
+    }
   }
 
   set wireframe(v) {
@@ -106,6 +148,7 @@ export class SoftBodyView {
   }
 
   update(sim, strainMax) {
+    this.syncRigid();
     const x = sim.x;
     const strain = sim.updateVertexStrain();
     const c = new THREE.Color();
@@ -137,5 +180,6 @@ export class SoftBodyView {
     this.fill.material.dispose();
     this.wire.material.dispose();
     this.grab.children[0].geometry.dispose();
+    this.setRigid([]);
   }
 }
