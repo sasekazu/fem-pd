@@ -1,4 +1,5 @@
 import { lame, polarRotation } from '../math2d.js';
+import { ContactModel } from '../contact.js';
 
 export const DEFAULT_PARAMS = {
   E: 5e6, // Young's modulus
@@ -25,8 +26,8 @@ export class SoftBodyBase {
     this.pinned = new Uint8Array(mesh.n);
     this.pinTarget = new Float64Array(mesh.X); // where pinned vertices must be (prescribed motion)
     this.stats = { stepMs: 0, iterations: 0 };
-    // Floor contact: penalty energy  sum_i 1/2 k m_i max(0, floorY - y_i)^2  (k in 1/s^2, mass-scaled)
-    this.contact = { enabled: false, floorY: 0, k: 1e5 };
+    // Penalty contact of the vertices with the floor and rigid colliders (see contact.js)
+    this.contact = new ContactModel();
     this.vertexStrain = new Float32Array(mesh.n);
     this.setPinned(mesh.fixedIdx);
     this._updateMaterial();
@@ -57,20 +58,19 @@ export class SoftBodyBase {
 
   onParamsChanged() {}
 
+  /** Floor settings {enabled, floorY, k}; k also applies to the rigid colliders. */
   setContact(c) {
-    Object.assign(this.contact, c);
+    this.contact.set(c);
   }
 
-  /** Floor penalty energy at positions x. */
+  /** Kinematic rigid colliders (see rigid.js). The objects may be shared between solvers. */
+  setColliders(list) {
+    this.contact.bodies = Array.from(list);
+  }
+
+  /** Contact penalty energy at positions x. */
   contactEnergy(x) {
-    const { enabled, floorY, k } = this.contact;
-    if (!enabled) return 0;
-    let e = 0;
-    for (let i = 0; i < this.n; i++) {
-      const d = floorY - x[2 * i + 1];
-      if (d > 0) e += 0.5 * k * this.mass[i] * d * d;
-    }
-    return e;
+    return this.contact.energy(x, this.mass, this.n);
   }
 
   /** Exact corotational energy  sum_e area (mu ||F-R||^2 + lambda/2 (tr(R^T F) - 2)^2). */

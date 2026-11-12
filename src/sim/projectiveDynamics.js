@@ -29,9 +29,10 @@ export class ProjectiveDynamics extends SoftBodyBase {
     this._xn = new Float64Array(2 * n);
     this._rhs = new Float64Array(2 * n);
     this._xt = new Float64Array(2 * n);
+    this._xz = new Float64Array(2 * n);
     this._tg = [1, 0, 0, 1];
     this._rot = [1, 0];
-    this.lbfgsM = 6; // L-BFGS history used when floor contact is enabled (0 = plain PD + line search)
+    this.lbfgsM = 6; // L-BFGS history used when contact (floor / rigid colliders) is enabled (0 = plain PD + line search)
     this._G = this._buildGradients();
   }
 
@@ -174,7 +175,7 @@ export class ProjectiveDynamics extends SoftBodyBase {
 
   /**
    * Gradient of the implicit-Euler objective at x over the free DOFs, layout [x-block(nf), y-block(nf)]:
-   *   M (x - y)/h^2 + sum_e area w G^T (F - P) + contact gradient.
+   *   M (x - y)/h^2 + sum_e area w G^T (F - P) + contact gradient (floor / rigid colliders).
    */
   _gradient(x, y, h2, g) {
     const { tris, area, n } = this.mesh;
@@ -184,17 +185,23 @@ export class ProjectiveDynamics extends SoftBodyBase {
     const G = this._G;
     const w = 2 * this.mu + 2 * this.lambda;
     const tg = this._tg;
-    const { enabled, floorY, k } = this.contact;
     g.fill(0);
     for (let i = 0; i < n; i++) {
       const f = fidx[i];
       if (f < 0) continue;
       g[f] += (mass[i] * (x[2 * i] - y[2 * i])) / h2;
       g[nf + f] += (mass[i] * (x[2 * i + 1] - y[2 * i + 1])) / h2;
-      if (enabled) {
-        const d = floorY - x[2 * i + 1];
-        if (d > 0) g[nf + f] -= k * mass[i] * d;
-      }
+    }
+    // contact penalty: dE/dx_i = k m_i phi n
+    const ct = this.contact;
+    const cnt = ct.collect(x, n);
+    for (let t = 0; t < cnt; t++) {
+      const i = ct.idx[t];
+      const f = fidx[i];
+      if (f < 0) continue;
+      const sc = ct.k * mass[i] * ct.phi[t];
+      g[f] += sc * ct.nx[t];
+      g[nf + f] += sc * ct.ny[t];
     }
     for (let e = 0; e < area.length; e++) {
       const i0 = tris[3 * e];
@@ -235,7 +242,7 @@ export class ProjectiveDynamics extends SoftBodyBase {
   /**
    * Quasi-Newton minimisation of the implicit-Euler objective (Liu, Bouaziz & Kavan 2016):
    * the constant PD matrix A = M/h^2 + L is the initial inverse-Hessian of L-BFGS, with an
-   * Armijo backtracking line search. Floor contact only appears in the objective/gradient.
+   * Armijo backtracking line search. Contact only appears in the objective/gradient.
    * Returns the number of line-search backtracks.
    */
   _solveLBFGS(x, y, h2, eRef) {
@@ -344,7 +351,7 @@ export class ProjectiveDynamics extends SoftBodyBase {
     return backtracks;
   }
 
-  /** Implicit-Euler objective: inertia + corotational elasticity + floor penalty. */
+  /** Implicit-Euler objective: inertia + corotational elasticity + contact penalty. */
   _objective(x, y, h2) {
     const { mass, n } = this;
     let e = 0;
@@ -394,7 +401,7 @@ export class ProjectiveDynamics extends SoftBodyBase {
       }
     }
 
-    const { enabled: contactOn, floorY, k: kc } = this.contact;
+    const contactOn = this.contact.enabled;
     let lineSearchSteps = 0;
     const useLBFGS = contactOn && this.lbfgsM > 0;
     if (useLBFGS) {
@@ -443,18 +450,20 @@ export class ProjectiveDynamics extends SoftBodyBase {
           by[fa] += we * (G[o + 2 * a] * p10 + G[o + 2 * a + 1] * p11);
         }
       }
-      // ---- floor contact (Liu, Bouaziz & Kavan 2016): the penalty energy enters the gradient
+      // ---- contact (Liu, Bouaziz & Kavan 2016): the penalty energy enters the gradient
       //      (-> right-hand side) but NOT the constant matrix, so no re-factorisation is needed.
       let anyActive = false;
       if (contactOn) {
-        for (let i = 0; i < n; i++) {
+        const ct = this.contact;
+        const cnt = ct.collect(x, n);
+        for (let t = 0; t < cnt; t++) {
+          const i = ct.idx[t];
           const f = fidx[i];
           if (f < 0) continue;
-          const d = floorY - x[2 * i + 1];
-          if (d > 0) {
-            by[f] += kc * mass[i] * d;
-            anyActive = true;
-          }
+          const fc = -ct.k * mass[i] * ct.phi[t]; // contact force k m |phi| n
+          bx[f] += fc * ct.nx[t];
+          by[f] += fc * ct.ny[t];
+          anyActive = true;
         }
       }
       // ---- global step ----
@@ -462,11 +471,14 @@ export class ProjectiveDynamics extends SoftBodyBase {
       this._chol.solve(by, this._zy);
       let alpha = 1;
       if (contactOn) {
-        let trialActive = false;
+        // does the unconstrained global-step result touch a collider?
+        const xz = this._xz;
         for (let i = 0; i < n; i++) {
           const f = fidx[i];
-          if (f >= 0 && floorY - this._zy[f] > 0) trialActive = true;
+          xz[2 * i] = f < 0 ? x[2 * i] : this._zx[f];
+          xz[2 * i + 1] = f < 0 ? x[2 * i + 1] : this._zy[f];
         }
+        const trialActive = this.contact.collect(xz, n) > 0;
         if (anyActive || trialActive) {
           // backtracking line search on the full objective (inertia + elasticity + contact):
           // the inexact Hessian (no contact stiffness) can overshoot.

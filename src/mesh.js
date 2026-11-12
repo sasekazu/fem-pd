@@ -4,7 +4,7 @@
 //   Dinv (Float64Array 4m: inverse of the rest edge matrix Dm = [e1 e2], row-major),
 //   area (Float64Array m), fixedIdx (default pinned vertices), tipIdx (probe vertex),
 //   boundary (Uint32Array, vertices on the boundary), outline (Float64Array xy of the rest boundary loop),
-//   kind ('rect' | 'disc') plus the shape parameters.
+//   kind ('rect' | 'block' | 'disc') plus the shape parameters.
 
 function finalizeMesh(X, tris) {
   const n = X.length / 2;
@@ -97,6 +97,27 @@ export function createRectMesh(width = 4, height = 1, nx = 40, ny = 8) {
   const outline = Float64Array.from([0, -height / 2, width, -height / 2, width, height / 2, 0, height / 2]);
 
   return { kind: 'rect', nx, ny, width, height, ...finalizeMesh(X, tris), fixedIdx, leftIdx: fixedIdx, rightIdx, tipIdx, outline };
+}
+
+/**
+ * Free (nothing pinned) rectangular block of the given size whose bottom edge centre sits at `bottomCenter`.
+ * Same triangulation as createRectMesh. With `pinBottom` the vertices of the bottom edge are pinned (fixedIdx).
+ */
+export function createBlockMesh(width = 2, height = 1, nx = 24, ny = 12, bottomCenter = [0, 0], pinBottom = false) {
+  const m = createRectMesh(width, height, nx, ny);
+  const dx = bottomCenter[0] - width / 2;
+  const dy = bottomCenter[1] + height / 2;
+  for (let i = 0; i < m.n; i++) {
+    m.X[2 * i] += dx;
+    m.X[2 * i + 1] += dy;
+  }
+  for (let i = 0; i < m.outline.length; i += 2) {
+    m.outline[i] += dx;
+    m.outline[i + 1] += dy;
+  }
+  m.kind = 'block';
+  m.fixedIdx = pinBottom ? Uint32Array.from({ length: nx + 1 }, (_, i) => i) : new Uint32Array(0); // bottom row = vertices 0..nx
+  return m;
 }
 
 /**

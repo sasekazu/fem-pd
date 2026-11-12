@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import GUI from 'lil-gui';
-import { createRectMesh, createDiscMesh } from './mesh.js';
+import { createRectMesh, createDiscMesh, createBlockMesh } from './mesh.js';
 import { CorotationalFEM } from './sim/corotationalFEM.js';
 import { ProjectiveDynamics } from './sim/projectiveDynamics.js';
 import { DEFAULT_PARAMS } from './sim/base.js';
@@ -8,6 +8,7 @@ import { SoftBodyView, fitCamera } from './render.js';
 import { StretchDriver } from './stretch.js';
 import { LinePlot } from './plot.js';
 import { MouseGrabber, viewportToWorld } from './interaction.js';
+import { Polygon, Circle, boxVertices, regularVertices, starVertices, lShapeVertices } from './rigid.js';
 
 const canvas = document.getElementById('canvas');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -31,6 +32,13 @@ const SCENES = {
     mouseK: 8000, // heavy body: the mouse spring is mass-scaled per vertex, so it needs to be stiffer to lift it
     view: { cx: 0, cy: 0.95, w: 3.6, h: 3.0 },
   },
+  rigid: {
+    E: 1e6, nu: 0.3, density: 1000, gravity: 9.8, damping: 0.5,
+    width: 2, height: 1, nx: 24, ny: 12,
+    // contact k = 1e7: the mass-scaled penalty must be stiff compared with the material (see README)
+    substeps: 4, pdIterations: 20, floor: true, floorY: 0, contactK: 1e7, strainMax: 0.3, mouseK: 8000,
+    view: { cx: 0, cy: 1.15, w: 4.4, h: 3.2 },
+  },
   stretch: {
     E: 1e5, nu: 0.3, density: 1000, gravity: 0, damping: 2,
     width: 1, height: 1, nx: 16, ny: 16,
@@ -38,6 +46,18 @@ const SCENES = {
     view: null, // fitted to the bodies every frame
   },
 };
+
+// Kinematic rigid shapes (lengths in m); each factory returns a collider (see rigid.js).
+const RIGID_SHAPES = {
+  wedge: () => new Polygon(regularVertices(3, 0.5, -Math.PI / 2)), // sharp tip pointing down
+  box: () => new Polygon(boxVertices(0.9, 0.5)),
+  star: () => new Polygon(starVertices(5, 0.55, 0.24, -Math.PI / 2)),
+  'L-shape (concave)': () => new Polygon(lShapeVertices(0.9, 0.8, 0.45, 0.4)),
+  circle: () => new Circle(0.4),
+};
+const RIGID_CLEARANCE = 0.25; // gap between the lowest point of the rigid body and the block top at its home pose
+const RIGID_MAX_SPEED = 2; // [m/s] kinematic body follows its target at most this fast (avoids tunnelling)
+const RIGID_MAX_OMEGA = 4; // [rad/s]
 
 // ---- shared settings (edited through the GUI) ----
 const settings = {
@@ -62,6 +82,12 @@ const settings = {
   strainMax: 0.15,
   wireframe: true,
   paused: false,
+  rigidShape: 'wedge',
+  rigidPinBottom: false, // pin the bottom edge of the block
+  rigidAuto: true, // rigid body presses into the block along a scripted path
+  rigidDepth: 0.4, // how far the lowest point goes below the block top [m]
+  rigidPeriod: 6, // period of the scripted press [s]
+  rigidAngle: 0, // body rotation [deg]
   mouse: true, // drag the body with the mouse (not in the stretch scene)
   mouseK: 1500, // mouse spring stiffness [1/s²] (capped for stability, see interaction.js)
 };
@@ -75,6 +101,8 @@ let stepRequest = 0;
 const smoothing = { fem: null, pd: null };
 const track = { fem: null, pd: null };
 let y0 = 0; // initial centre-of-mass height (ball scene)
+let rigidBody = null; // Polygon / Circle collider shared by both solvers (rigid scene)
+const rigid = { x: 0, y: 0, angle: 0, tx: 0, ty: 0, tAngle: 0, time: 0, drag: null, lowest: 0, topY: 0 };
 let cameraRect = null; // smoothed shared view rectangle (stretch scene)
 
 function materialParams() {
@@ -132,13 +160,24 @@ function build() {
   viewPd?.dispose();
   const ball = settings.scene === 'ball';
   const stretch = settings.scene === 'stretch';
+  const hasRigid = settings.scene === 'rigid';
+  const { width, height } = SCENES[settings.scene];
   mesh = ball
     ? createDiscMesh(BALL_RADIUS, settings.rings, [0, settings.floorY + BALL_RADIUS + settings.gap])
-    : createRectMesh(SCENES[settings.scene].width, SCENES[settings.scene].height, settings.nx, settings.ny);
+    : hasRigid
+      ? createBlockMesh(width, height, settings.nx, settings.ny, [0, settings.floorY], settings.rigidPinBottom)
+      : createRectMesh(width, height, settings.nx, settings.ny);
   fem = new CorotationalFEM(mesh, materialParams());
   pd = new ProjectiveDynamics(mesh, materialParams());
   fem.setContact(contactParams());
   pd.setContact(contactParams());
+  rigidBody = hasRigid ? RIGID_SHAPES[settings.rigidShape]() : null;
+  fem.setColliders(rigidBody ? [rigidBody] : []);
+  pd.setColliders(rigidBody ? [rigidBody] : []);
+  if (rigidBody) {
+    rigid.topY = settings.floorY + height;
+    resetRigid();
+  }
   applySolverSettings();
   driver = null;
   if (stretch) {
@@ -149,6 +188,10 @@ function build() {
   viewFem = new SoftBodyView(mesh, rect);
   viewPd = new SoftBodyView(mesh, rect);
   viewFem.wireframe = viewPd.wireframe = settings.wireframe;
+  if (rigidBody) {
+    viewFem.setRigid([rigidBody]);
+    viewPd.setRigid([rigidBody]);
+  }
   y0 = fem.centerOfMass().y;
   accumulator = 0;
   smoothing.fem = smoothing.pd = null;
@@ -185,7 +228,46 @@ function pushContact() {
   pd.setContact(contactParams());
 }
 
+// ---- kinematic rigid body: scripted press and/or mouse drag, speed-limited ----
+/** y of the body origin when its lowest point is `depth` below the block top (negative depth: above). */
+function rigidYAt(depth, angle) {
+  return rigid.topY - depth - rigidBody.lowest(angle);
+}
+
+function resetRigid() {
+  if (!rigidBody) return;
+  rigid.time = 0;
+  rigid.drag = null;
+  rigid.angle = rigid.tAngle = (settings.rigidAngle * Math.PI) / 180;
+  rigid.x = rigid.tx = 0;
+  rigid.y = rigid.ty = rigidYAt(-RIGID_CLEARANCE, rigid.angle);
+  rigidBody.setPose(rigid.x, rigid.y, rigid.angle);
+}
+
+/** Advance the target (scripted path unless dragging) and move the pose towards it by at most the speed limits. */
+function advanceRigid(h) {
+  if (!rigidBody) return;
+  rigid.tAngle = rigid.drag ? rigid.tAngle : (settings.rigidAngle * Math.PI) / 180;
+  if (settings.rigidAuto && !rigid.drag) {
+    rigid.time += h;
+    const phase = 0.5 - 0.5 * Math.cos((2 * Math.PI * rigid.time) / settings.rigidPeriod); // 0 -> 1 -> 0
+    const depth = -RIGID_CLEARANCE + phase * (settings.rigidDepth + RIGID_CLEARANCE);
+    rigid.tx = 0;
+    rigid.ty = rigidYAt(depth, rigid.tAngle);
+  }
+  const dx = rigid.tx - rigid.x;
+  const dy = rigid.ty - rigid.y;
+  const dist = Math.hypot(dx, dy);
+  const step = Math.min(1, (RIGID_MAX_SPEED * h) / (dist || 1));
+  rigid.x += dx * step;
+  rigid.y += dy * step;
+  const da = rigid.tAngle - rigid.angle;
+  rigid.angle += Math.max(-RIGID_MAX_OMEGA * h, Math.min(RIGID_MAX_OMEGA * h, da));
+  rigidBody.setPose(rigid.x, rigid.y, rigid.angle);
+}
+
 function reset() {
+  resetRigid();
   if (driver) driver.reset(fem, pd);
   else {
     fem.reset();
@@ -199,7 +281,7 @@ function reset() {
 // ---- GUI ----
 const gui = new GUI({ title: 'Parameters' });
 gui
-  .add(settings, 'scene', { 'Cantilever beam': 'beam', 'Bouncing ball': 'ball', 'Stretch test': 'stretch' })
+  .add(settings, 'scene', { 'Cantilever beam': 'beam', 'Bouncing ball': 'ball', 'Rigid contact': 'rigid', 'Stretch test': 'stretch' })
   .name('scene')
   .onChange((name) => {
     Object.assign(settings, SCENES[name]);
@@ -240,13 +322,21 @@ fContact
   .name('floor height y')
   .onChange(pushContact)
   .onFinishChange(() => {
-    if (settings.scene === 'ball') build();
+    if (settings.scene === 'ball' || settings.scene === 'rigid') build();
   });
 fContact
   .add(settings, 'contactK', { '1e5 (soft)': 1e5, '1e6': 1e6, '1e7': 1e7, '1e8 (hard)': 1e8 })
   .name('stiffness k [1/s²]')
   .onChange(pushContact);
 fContact.add(settings, 'lbfgs', 0, 12, 1).name('PD L-BFGS history').onChange(applySolverSettings);
+
+const fRigid = gui.addFolder('Rigid body (kinematic)');
+fRigid.add(settings, 'rigidShape', Object.keys(RIGID_SHAPES)).name('shape').onChange(build);
+fRigid.add(settings, 'rigidPinBottom').name('pin block bottom').onChange(build);
+const cAuto = fRigid.add(settings, 'rigidAuto').name('scripted press');
+fRigid.add(settings, 'rigidDepth', 0, 0.9, 0.05).name('press depth [m]');
+fRigid.add(settings, 'rigidPeriod', 2, 20, 0.5).name('period [s]');
+fRigid.add(settings, 'rigidAngle', -180, 180, 1).name('angle [deg]');
 
 const fMouse = gui.addFolder('Mouse');
 fMouse
@@ -278,6 +368,7 @@ function updateSceneControls() {
   const s = settings.scene;
   for (const c of [cNx, cNy]) s === 'ball' ? c.hide() : c.show();
   for (const c of [cRings, cGap]) s === 'ball' ? c.show() : c.hide();
+  s === 'rigid' ? fRigid.show() : fRigid.hide();
   s === 'stretch' ? fStretch.show() : fStretch.hide();
   s === 'stretch' ? fContact.hide() : fContact.show();
   s === 'stretch' ? fMouse.hide() : fMouse.show();
@@ -337,6 +428,13 @@ function statsText(sim, ms, tr, labelIt) {
       const rebound = (100 * (tr.apexes[0] - yRest)) / (y0 - yRest);
       s += row('rebound', `${rebound.toFixed(1)} %`);
     } else s += row('rebound', '-');
+  } else if (scene === 'rigid') {
+    const ci = settings.floor ? 1 : 0; // collider list: floor (if on) then the rigid body
+    const f = sim.contact.colliderForces(sim.x, sim.mass, sim.n)[ci];
+    s += row('force on rigid', `${(-f.fy).toFixed(0)} N`);
+    s += row('contacts', f.count);
+    s += row('max pen.', `${(1000 * sim.contact.maxPenetration(sim.x, sim.n, ci)).toFixed(2)} mm`);
+    s += row('min det F', sim.deformationStats().minDet.toFixed(3));
   } else if (scene === 'stretch') {
     const st = sim.deformationStats();
     s += row('stretch s', `${driver.stretch.toFixed(2)} x`);
@@ -418,6 +516,7 @@ function pointerWorld(e, which) {
 
 function releaseGrab() {
   grabber.release();
+  rigid.drag = null;
   dragView = -1;
 }
 
@@ -426,13 +525,30 @@ canvas.addEventListener('pointerdown', (e) => {
   const r = canvas.getBoundingClientRect();
   const which = e.clientX - r.left < Math.floor(r.width / 2) ? 0 : 1;
   const [wx, wy] = pointerWorld(e, which);
+  if (rigidBody?.contains(wx, wy)) {
+    // drag the kinematic rigid body (the scripted press is switched off)
+    rigid.drag = { dx: rigid.x - wx, dy: rigid.y - wy };
+    rigid.tx = rigid.x;
+    rigid.ty = rigid.y;
+    dragView = which;
+    settings.rigidAuto = false;
+    cAuto.updateDisplay();
+    canvas.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    return;
+  }
   if (!grabber.grab(which === 0 ? fem : pd, wx, wy)) return;
   dragView = which;
   canvas.setPointerCapture(e.pointerId);
   e.preventDefault();
 });
 canvas.addEventListener('pointermove', (e) => {
-  if (dragView >= 0) grabber.setTarget(...pointerWorld(e, dragView));
+  if (dragView < 0) return;
+  const [wx, wy] = pointerWorld(e, dragView);
+  if (rigid.drag) {
+    rigid.tx = wx + rigid.drag.dx;
+    rigid.ty = wy + rigid.drag.dy;
+  } else grabber.setTarget(wx, wy);
 });
 for (const type of ['pointerup', 'pointercancel']) canvas.addEventListener(type, releaseGrab);
 
@@ -457,6 +573,7 @@ function frame(now) {
   }
   for (let s = 0; s < steps; s++) {
     if (driver) driver.advance(h, fem, pd);
+    advanceRigid(h);
     grabber.applyForces(fem, h);
     grabber.applyForces(pd, h);
     fem.step(h);
@@ -505,4 +622,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // handy for debugging from the console
-window.sim = { settings, build, grabber, get fem() { return fem; }, get pd() { return pd; }, get driver() { return driver; } };
+window.sim = { settings, build, grabber, rigid, get rigidBody() { return rigidBody; }, get fem() { return fem; }, get pd() { return pd; }, get driver() { return driver; } };
