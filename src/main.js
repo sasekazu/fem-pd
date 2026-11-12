@@ -7,6 +7,7 @@ import { DEFAULT_PARAMS } from './sim/base.js';
 import { SoftBodyView, fitCamera } from './render.js';
 import { StretchDriver } from './stretch.js';
 import { LinePlot } from './plot.js';
+import { MouseGrabber, viewportToWorld } from './interaction.js';
 
 const canvas = document.getElementById('canvas');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -21,18 +22,19 @@ const SCENES = {
   beam: {
     E: 5e6, nu: 0.3, density: 1000, gravity: 9.8, damping: 1,
     width: 4, height: 1, nx: 40, ny: 8,
-    substeps: 1, pdIterations: 10, floor: false, floorY: -1.6, contactK: 1e6, strainMax: 0.15,
+    substeps: 1, pdIterations: 10, floor: false, floorY: -1.6, contactK: 1e6, strainMax: 0.15, mouseK: 1500,
     view: { cx: 2.2, cy: -0.9, w: 5.6, h: 4.2 },
   },
   ball: {
     E: 1e6, nu: 0.3, density: 1000, gravity: 9.8, damping: 0,
     substeps: 4, pdIterations: 20, floor: true, floorY: 0, contactK: 1e6, strainMax: 0.15,
+    mouseK: 8000, // heavy body: the mouse spring is mass-scaled per vertex, so it needs to be stiffer to lift it
     view: { cx: 0, cy: 0.95, w: 3.6, h: 3.0 },
   },
   stretch: {
     E: 1e5, nu: 0.3, density: 1000, gravity: 0, damping: 2,
     width: 1, height: 1, nx: 16, ny: 16,
-    substeps: 2, pdIterations: 20, floor: false, floorY: -1.6, contactK: 1e6, strainMax: 2,
+    substeps: 2, pdIterations: 20, floor: false, floorY: -1.6, contactK: 1e6, strainMax: 2, mouseK: 1500,
     view: null, // fitted to the bodies every frame
   },
 };
@@ -60,10 +62,14 @@ const settings = {
   strainMax: 0.15,
   wireframe: true,
   paused: false,
+  mouse: true, // drag the body with the mouse (not in the stretch scene)
+  mouseK: 1500, // mouse spring stiffness [1/s²] (capped for stability, see interaction.js)
 };
 Object.assign(settings, SCENES[settings.scene]);
 
 let mesh, fem, pd, viewFem, viewPd, driver = null;
+const grabber = new MouseGrabber({ stiffness: settings.mouseK });
+let dragView = -1; // 0 = FEM half, 1 = PD half (the half the drag started in)
 let accumulator = 0;
 let stepRequest = 0;
 const smoothing = { fem: null, pd: null };
@@ -119,6 +125,9 @@ function samplePlots() {
 }
 
 function build() {
+  grabber.release();
+  grabber.stiffness = settings.mouseK;
+  dragView = -1;
   viewFem?.dispose();
   viewPd?.dispose();
   const ball = settings.scene === 'ball';
@@ -239,6 +248,18 @@ fContact
   .onChange(pushContact);
 fContact.add(settings, 'lbfgs', 0, 12, 1).name('PD L-BFGS history').onChange(applySolverSettings);
 
+const fMouse = gui.addFolder('Mouse');
+fMouse
+  .add(settings, 'mouse')
+  .name('drag with mouse')
+  .onChange((v) => {
+    if (!v) releaseGrab();
+  });
+fMouse
+  .add(settings, 'mouseK', 100, 30000, 100)
+  .name('spring stiffness [1/s²]')
+  .onChange((v) => (grabber.stiffness = v));
+
 const fSim = gui.addFolder('Simulation');
 fSim.add(settings, 'dt', { '1/240 s': 1 / 240, '1/120 s': 1 / 120, '1/60 s': 1 / 60, '1/30 s': 1 / 30 }).name('time step dt');
 fSim.add(settings, 'substeps', 1, 8, 1).name('substeps');
@@ -259,6 +280,7 @@ function updateSceneControls() {
   for (const c of [cRings, cGap]) s === 'ball' ? c.show() : c.hide();
   s === 'stretch' ? fStretch.show() : fStretch.hide();
   s === 'stretch' ? fContact.hide() : fContact.show();
+  s === 'stretch' ? fMouse.hide() : fMouse.show();
 }
 updateSceneControls();
 
@@ -380,6 +402,40 @@ if (window.innerWidth < 800) gui.close();
 resize();
 build();
 
+// ---- mouse interaction: grab a point of the body and drag it with a spring ----
+// The grab is picked in the half (FEM / PD) that was clicked, but the same material point and the same
+// world-space target are applied to both solvers.
+const mouseEnabled = () => settings.mouse && settings.scene !== 'stretch';
+
+function pointerWorld(e, which) {
+  const r = canvas.getBoundingClientRect();
+  const half = Math.floor(r.width / 2);
+  const x0 = which === 0 ? 0 : half;
+  const w = which === 0 ? half : r.width - half;
+  const view = which === 0 ? viewFem : viewPd;
+  return viewportToWorld(view.camera, (e.clientX - r.left - x0) / w, (e.clientY - r.top) / r.height);
+}
+
+function releaseGrab() {
+  grabber.release();
+  dragView = -1;
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || !mouseEnabled()) return;
+  const r = canvas.getBoundingClientRect();
+  const which = e.clientX - r.left < Math.floor(r.width / 2) ? 0 : 1;
+  const [wx, wy] = pointerWorld(e, which);
+  if (!grabber.grab(which === 0 ? fem : pd, wx, wy)) return;
+  dragView = which;
+  canvas.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (dragView >= 0) grabber.setTarget(...pointerWorld(e, dragView));
+});
+for (const type of ['pointerup', 'pointercancel']) canvas.addEventListener(type, releaseGrab);
+
 let last = performance.now();
 function frame(now) {
   requestAnimationFrame(frame);
@@ -401,6 +457,8 @@ function frame(now) {
   }
   for (let s = 0; s < steps; s++) {
     if (driver) driver.advance(h, fem, pd);
+    grabber.applyForces(fem, h);
+    grabber.applyForces(pd, h);
     fem.step(h);
     pd.step(h);
     smoothing.fem = ema(smoothing.fem, fem.stats.stepMs);
@@ -415,6 +473,10 @@ function frame(now) {
 
   viewFem.update(fem, settings.strainMax);
   viewPd.update(pd, settings.strainMax);
+  viewFem.setGrab(grabber.active ? grabber.point(fem) : null, grabber.target);
+  viewPd.setGrab(grabber.active ? grabber.point(pd) : null, grabber.target);
+  const cursor = !mouseEnabled() ? 'default' : grabber.active ? 'grabbing' : 'grab';
+  if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
   viewFem.setFloor(settings.floor && !driver, settings.floorY);
   viewPd.setFloor(settings.floor && !driver, settings.floorY);
   if (driver) viewFem.viewRect = viewPd.viewRect = fitBodies();
@@ -443,4 +505,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // handy for debugging from the console
-window.sim = { settings, build, get fem() { return fem; }, get pd() { return pd; }, get driver() { return driver; } };
+window.sim = { settings, build, grabber, get fem() { return fem; }, get pd() { return pd; }, get driver() { return driver; } };

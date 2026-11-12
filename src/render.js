@@ -63,6 +63,19 @@ export class SoftBodyView {
     this._pinN = -1;
     this.scene.add(this.pins);
 
+    // mouse grab indicator: grabbed material point -> pointer target (line + two dots)
+    this.grabPos = new Float32Array(6);
+    const gg = new THREE.BufferGeometry();
+    gg.setAttribute('position', new THREE.BufferAttribute(this.grabPos, 3).setUsage(THREE.DynamicDrawUsage));
+    this.grab = new THREE.Group();
+    this.grab.add(
+      new THREE.Line(gg, new THREE.LineBasicMaterial({ color: 0xffffff })),
+      new THREE.Points(gg, new THREE.PointsMaterial({ color: 0xffffff, size: 9, sizeAttenuation: false }))
+    );
+    for (const o of this.grab.children) o.frustumCulled = false; // positions change every frame
+    this.grab.visible = false;
+    this.scene.add(this.grab);
+
     // floor: a dark slab below y = floorY and a bright line on its top edge
     this.floor = new THREE.Group();
     const slab = new THREE.Mesh(new THREE.PlaneGeometry(60, 30), new THREE.MeshBasicMaterial({ color: 0x232a36 }));
@@ -82,6 +95,14 @@ export class SoftBodyView {
   setFloor(visible, y) {
     this.floor.visible = visible;
     this.floor.position.y = y;
+  }
+
+  /** Show the grab indicator between the grabbed point `p` of this body and the pointer `target` (null hides it). */
+  setGrab(p, target) {
+    this.grab.visible = !!p;
+    if (!p) return;
+    this.grabPos.set([p[0], p[1], 0.03, target[0], target[1], 0.03]);
+    this.grab.children[0].geometry.attributes.position.needsUpdate = true;
   }
 
   update(sim, strainMax) {
@@ -115,5 +136,6 @@ export class SoftBodyView {
     this.geometry.dispose();
     this.fill.material.dispose();
     this.wire.material.dispose();
+    this.grab.children[0].geometry.dispose();
   }
 }
