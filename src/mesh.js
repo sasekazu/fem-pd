@@ -101,9 +101,9 @@ export function createRectMesh(width = 4, height = 1, nx = 40, ny = 8) {
 
 /**
  * Free (nothing pinned) rectangular block of the given size whose bottom edge centre sits at `bottomCenter`.
- * Same triangulation as createRectMesh.
+ * Same triangulation as createRectMesh. With `pinBottom` the vertices of the bottom edge are pinned (fixedIdx).
  */
-export function createBlockMesh(width = 2, height = 1, nx = 24, ny = 12, bottomCenter = [0, 0]) {
+export function createBlockMesh(width = 2, height = 1, nx = 24, ny = 12, bottomCenter = [0, 0], pinBottom = false) {
   const m = createRectMesh(width, height, nx, ny);
   const dx = bottomCenter[0] - width / 2;
   const dy = bottomCenter[1] + height / 2;
@@ -116,7 +116,7 @@ export function createBlockMesh(width = 2, height = 1, nx = 24, ny = 12, bottomC
     m.outline[i + 1] += dy;
   }
   m.kind = 'block';
-  m.fixedIdx = new Uint32Array(0);
+  m.fixedIdx = pinBottom ? Uint32Array.from({ length: nx + 1 }, (_, i) => i) : new Uint32Array(0); // bottom row = vertices 0..nx
   return m;
 }
 

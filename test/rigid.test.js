@@ -247,6 +247,45 @@ test('FEM and PD agree on the wedge press (force on the rigid body and block sha
   assert.ok(dmax < 0.02, `max vertex difference ${dmax}`);
 });
 
+test('createBlockMesh: pinBottom pins exactly the bottom row; pinned block stays put and FEM/PD agree', () => {
+  const free = createBlockMesh(1, 0.6, 14, 8, [0, 0]);
+  assert.equal(free.fixedIdx.length, 0);
+  const mesh = createBlockMesh(1, 0.6, 14, 8, [0, 0], true);
+  assert.equal(mesh.fixedIdx.length, 15);
+  for (const i of mesh.fixedIdx) close(mesh.X[2 * i + 1], 0, 1e-15, 'bottom row at y = 0');
+  const run = (S) => {
+    // Tip 3 cm off-centre (the vertex spacing is 7.1 cm): a vertex exactly under the apex would slide down
+    // either flank, and FEM / PD could legitimately pick opposite sides.
+    const body = new Polygon(regularVertices(3, 0.5, -Math.PI / 2), { x: 0.03, y: 1.3 });
+    const s = new S(mesh, MAT);
+    if (S === ProjectiveDynamics) s.iterations = 30;
+    s.setContact({ enabled: true, floorY: 0, k: 1e7 });
+    s.setColliders([body]);
+    const steps = Math.round(0.4 / (0.1 * H));
+    for (let i = 0; i < steps + 240; i++) {
+      body.setPose(0.03, i < steps ? 1.3 - (0.4 * i) / steps : 0.9, 0);
+      s.step(H);
+    }
+    return s;
+  };
+  const a = run(CorotationalFEM);
+  const b = run(ProjectiveDynamics);
+  for (const s of [a, b]) {
+    for (const i of mesh.fixedIdx) {
+      assert.equal(s.x[2 * i], mesh.X[2 * i]);
+      assert.equal(s.x[2 * i + 1], mesh.X[2 * i + 1]);
+    }
+  }
+  const fa = a.contact.colliderForces(a.x, a.mass, a.n)[1];
+  const fb = b.contact.colliderForces(b.x, b.mass, b.n)[1];
+  assert.ok(fa.fy < 0);
+  close(fa.fy, fb.fy, 0.02 * Math.abs(fa.fy), 'press force');
+  close(fa.fx, fb.fx, 0.02 * Math.abs(fa.fy), 'lateral force');
+  let dmax = 0;
+  for (let i = 0; i < a.x.length; i++) dmax = Math.max(dmax, Math.abs(a.x[i] - b.x[i]));
+  assert.ok(dmax < 0.01, `max vertex difference ${dmax}`);
+});
+
 test('PD without L-BFGS (plain local/global + line search) gives the same wedge press', () => {
   const mk = () => new Polygon(regularVertices(3, 0.5, -Math.PI / 2), { x: 0.07, y: 1.3 });
   const run = (lbfgsM) => {

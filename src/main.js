@@ -82,6 +82,7 @@ const settings = {
   wireframe: true,
   paused: false,
   rigidShape: 'wedge',
+  rigidPinBottom: false, // pin the bottom edge of the block
   rigidAuto: true, // rigid body presses into the block along a scripted path
   rigidDepth: 0.4, // how far the lowest point goes below the block top [m]
   rigidPeriod: 6, // period of the scripted press [s]
@@ -163,7 +164,7 @@ function build() {
   mesh = ball
     ? createDiscMesh(BALL_RADIUS, settings.rings, [0, settings.floorY + BALL_RADIUS + settings.gap])
     : hasRigid
-      ? createBlockMesh(width, height, settings.nx, settings.ny, [0, settings.floorY])
+      ? createBlockMesh(width, height, settings.nx, settings.ny, [0, settings.floorY], settings.rigidPinBottom)
       : createRectMesh(width, height, settings.nx, settings.ny);
   fem = new CorotationalFEM(mesh, materialParams());
   pd = new ProjectiveDynamics(mesh, materialParams());
@@ -339,6 +340,7 @@ fContact.add(settings, 'lbfgs', 0, 12, 1).name('PD L-BFGS history').onChange(app
 
 const fRigid = gui.addFolder('Rigid body (kinematic)');
 fRigid.add(settings, 'rigidShape', Object.keys(RIGID_SHAPES)).name('shape').onChange(build);
+fRigid.add(settings, 'rigidPinBottom').name('pin block bottom').onChange(build);
 const cAuto = fRigid.add(settings, 'rigidAuto').name('scripted press');
 fRigid.add(settings, 'rigidDepth', 0, 0.9, 0.05).name('press depth [m]');
 fRigid.add(settings, 'rigidPeriod', 2, 20, 0.5).name('period [s]');
