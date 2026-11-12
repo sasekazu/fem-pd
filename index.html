@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Corotational FEM vs Projective Dynamics</title>
+  <title>FEM vs Projective Dynamics</title>
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #14171c; color: #dfe5ee;
       font-family: system-ui, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; }
@@ -41,13 +41,13 @@
   <canvas id="canvas"></canvas>
   <div id="divider"></div>
   <div class="panel" id="panel-fem">
-    <h2>Corotational FEM</h2>
-    <div class="sub">implicit Euler, warped stiffness, CG</div>
+    <h2 id="title-fem">Corotational FEM</h2>
+    <div class="sub" id="sub-fem">implicit Euler, warped stiffness, CG</div>
     <pre id="stats-fem"></pre>
   </div>
   <div class="panel" id="panel-pd">
-    <h2>Projective Dynamics</h2>
-    <div class="sub">local/global, pre-factored Cholesky</div>
+    <h2 id="title-pd">Projective Dynamics</h2>
+    <div class="sub" id="sub-pd">local/global, pre-factored Cholesky</div>
     <pre id="stats-pd"></pre>
   </div>
   </div>
