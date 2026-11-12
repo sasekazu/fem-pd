@@ -1,6 +1,7 @@
 import { SoftBodyBase } from './base.js';
 import { polarRotation } from '../math2d.js';
 import { pcg, csrMul } from '../linalg.js';
+import { buildCsrPattern } from './csrPattern.js';
 
 /**
  * Corotational linear-triangle FEM (Mueller & Gross 2004 style).
@@ -46,40 +47,8 @@ export class CorotationalFEM extends SoftBodyBase {
 
   /** CSR sparsity pattern (scalar DOFs) and per-element scatter offsets. */
   _buildPattern() {
-    const { tris, n } = this.mesh;
-    const m = tris.length / 3;
-    const nbr = Array.from({ length: n }, () => new Set());
-    for (let e = 0; e < m; e++) {
-      for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) nbr[tris[3 * e + a]].add(tris[3 * e + b]);
-    }
-    const sorted = nbr.map((s) => Array.from(s).sort((p, q) => p - q));
-    const rowPtr = new Int32Array(2 * n + 1);
-    for (let i = 0; i < n; i++) {
-      rowPtr[2 * i + 1] = rowPtr[2 * i] + 2 * sorted[i].length;
-      rowPtr[2 * i + 2] = rowPtr[2 * i + 1] + 2 * sorted[i].length;
-    }
-    const colIdx = new Int32Array(rowPtr[2 * n]);
-    for (let i = 0; i < n; i++) {
-      sorted[i].forEach((j, q) => {
-        for (let k = 0; k < 2; k++) {
-          colIdx[rowPtr[2 * i + k] + 2 * q] = 2 * j;
-          colIdx[rowPtr[2 * i + k] + 2 * q + 1] = 2 * j + 1;
-        }
-      });
-    }
-    // scatter[e][a][b] -> offsets of the 2x2 block (row 0 start, row 1 start)
-    const scatter = new Int32Array(m * 9 * 2);
-    for (let e = 0; e < m; e++) {
-      for (let a = 0; a < 3; a++) {
-        const i = tris[3 * e + a];
-        for (let b = 0; b < 3; b++) {
-          const q = sorted[i].indexOf(tris[3 * e + b]);
-          scatter[(e * 9 + a * 3 + b) * 2] = rowPtr[2 * i] + 2 * q;
-          scatter[(e * 9 + a * 3 + b) * 2 + 1] = rowPtr[2 * i + 1] + 2 * q;
-        }
-      }
-    }
-    this.csr = { rowPtr, colIdx, vals: new Float64Array(colIdx.length), diag: new Float64Array(2 * n) };
+    const { csr, scatter } = buildCsrPattern(this.mesh);
+    this.csr = csr;
     this._scatter = scatter;
   }
 

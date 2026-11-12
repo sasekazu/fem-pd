@@ -1,7 +1,8 @@
-# Corotational FEM vs Projective Dynamics (2D)
+# FEM vs Projective Dynamics (2D)
 
 左右 2 画面で、同じ弾性体（片持ち梁、床で跳ねるボール、左右に引き伸ばす長方形）を
-**Corotational FEM**（左）と **Projective Dynamics**（右）で同時にシミュレーションして比較する Web アプリ。
+**FEM**（左）と **Projective Dynamics**（右）で同時にシミュレーションして比較する Web アプリ。
+材料は GUI の `material model` で **Corotational** と **Stable Neo-Hookean** を切り替えられる。
 
 ## 起動
 
@@ -19,7 +20,7 @@ npm start            # python -m http.server 8000
 
 ```bash
 npm install          # テスト用の ml-matrix を取得（初回のみ）
-npm test             # node --test（数値コアの単体テスト + 静的たわみの FEM/PD/梁理論の一致 + 疎 Cholesky の検証）
+npm test             # node --test（数値コアの単体テスト + 静的たわみの FEM/PD/梁理論の一致 + 疎 Cholesky の検証 + Neo-Hookean の検証）
 ```
 
 ## 構成
@@ -28,12 +29,15 @@ npm test             # node --test（数値コアの単体テスト + 静的た�
 |---|---|
 | `src/mesh.js` | 長方形の自動三角形分割（対角線を交互に配置）と、円盤（同心リング）の三角形分割 |
 | `src/sim/corotationalFEM.js` | 線形三角形 + 要素ごとの極分解、warped stiffness、陰的オイラー、Jacobi 前処理 CG |
+| `src/materials.js` | Stable Neo-Hookean（2D）のエネルギー・第一 Piola-Kirchhoff 応力・ヘッシアン（負の固有値をクランプする PSD 射影つき） |
+| `src/sim/hyperelasticFEM.js` | Neo-Hookean 用の線形三角形 FEM。陰的オイラーを増分ポテンシャルの最小化として **Newton 法**で解く（PSD 射影ヘッシアン + Jacobi 前処理 CG + Armijo 直線探索） |
+| `src/sim/csrPattern.js` | 三角形メッシュの CSR パターンと要素ごとの scatter オフセット（両 FEM で共有） |
 | `src/sim/projectiveDynamics.js` | ARAP + 面積制約の local/global、固定頂点を除いた行列を疎 Cholesky で事前分解 |
 | `src/sparse/cholesky.js` | 汎用の疎 Cholesky（RCM 並べ替え + 消去木 + up-looking 法、CSC）。メッシュ構造に依存しない |
-| `src/sim/base.js` | 両ソルバ共通（状態・質量・固定点・外力・ひずみ計算）。`step(h) / reset() / setPinned() / addForce()` |
+| `src/sim/base.js` | 両ソルバ共通（状態・質量・固定点・外力・ひずみ計算、材料モデルごとのエネルギー/内力）。`step(h) / reset() / setPinned() / addForce()` |
 | `src/stretch.js` | 引張試験のドライバ（両端の頂点列を目標位置へ動かす。ソルバ非依存） |
 | `src/plot.js` | 依存なしの軽量な折れ線プロット（引張→除荷のように x が戻る曲線も描ける） |
-| `scripts/stretch_sweep.mjs` | ν を振って引張し、反転が始まる伸び比を調べる（`npm run sweep`） |
+| `scripts/stretch_sweep.mjs` | ν を振って引張し、反転が始まる伸び比を調べる（`npm run sweep`、第 6 引数に `neohookean` で Neo-Hookean） |
 | `src/render.js` | three.js 描画（`OrthographicCamera`、ひずみで頂点着色） |
 | `src/main.js` | ループ、GUI（lil-gui）、左右ビューポート描画 |
 
@@ -101,7 +105,43 @@ Ly et al. 2020（摩擦つき PD）は未読。
 - 反転が始まる伸び比、反転前の反力は FEM と PD でほぼ同じ。反転後（s*超）も NaN や発散はなく、反力も近い値を保つ（ただし要素が大量に潰れており物理的には意味がない）。
 - **反転した状態からも、除荷すれば元の形に完全に戻る**（ν=0.3、s=10 で 424/512 反転 → 除荷後 反転 0、最大偏差 0.000）。
 
-**結論**: FEM と PD のどちらも「数値的には」非常に長く引き伸ばしても壊れない。ただし corotational 材料自体の限界として、ν に応じた伸び比（ν=0.3 で約 3.3 倍）で要素が反転する。それより大きな伸びを物理的に正しく扱うには、反転に強い材料モデル（Stable Neo-Hookean など）が必要。
+**結論**: FEM と PD のどちらも「数値的には」非常に長く引き伸ばしても壊れない。ただし corotational 材料自体の限界として、ν に応じた伸び比（ν=0.3 で約 3.3 倍）で要素が反転する。それより大きな伸びを物理的に正しく扱うには、反転に強い材料モデル（Stable Neo-Hookean など）が必要。→ 次節。
+
+## Stable Neo-Hookean
+
+GUI の `material model` で選ぶ（切り替えるとシーンを作り直す）。2D の定式化（Smith, de Goes & Kim 2018 の 2D 版）:
+
+```
+Ψ(F) = μ/2 (‖F‖² − 2) − μ (J − 1) + λ'/2 (J − 1)²,   J = det F
+P(F) = μ F + (λ'(J − 1) − μ) cof F
+```
+
+- F=I で Ψ=0、P=0（静止状態で安定）。J ≤ 0 でも Ψ は有限なので、反転しても元に戻る力が働く（`ln J` 型は J→0 で発散する）。
+- **λ' = λ + μ**: `−μ(J−1)` を足すと静止状態の体積弾性が μ だけ下がる（展開すると線形弾性の λ が λ−μ になる）。λ' = λ + μ とすると静止状態のヘッシアンが線形弾性と一致し、小変形で corotational と同じ解になる（テストで確認）。3D の `μ' = 4μ/3, λ' = λ + 5μ/6` の 2D 版。
+- ヘッシアンは `F = U diag(σ0,σ1) Vᵀ` の座標系で固有系が閉形式になる（twist `λ'(J−1)`、flip `2μ − λ'(J−1)`、スケーリングの 2×2 ブロック）。負の固有値を 0 にして Newton の行列を常に正定値にする（`snhHessian`）。
+
+| | 方法 |
+|---|---|
+| FEM（左） | 増分ポテンシャル `Σ m‖x−y‖²/2h² + Ψ + 接触` を **Newton 法**で最小化。各反復で厳密な勾配と PSD 射影ヘッシアンを組み、CG で解く。接触もペナルティの勾配 + 対角ヘッシアンで同じ目的関数に入れる |
+| PD（右） | Neo-Hookean は二次の射影の和にならないので local/global は使えない。**既存の定数 PD 行列を初期逆ヘシアンにした L-BFGS**で、同じ厳密な目的関数を最小化する（Liu et al. 2017 の準ニュートン解釈）。接触の有無に関わらず常に L-BFGS（履歴は最小 1） |
+
+FEM と PD は**同じ目的関数**の最小化なので、収束すれば同じ解になる。`PD iterations` は Neo-Hookean では L-BFGS の反復回数。
+
+### 結果（引張試験、E=1e5、16×16、片側 0.5 m/s、サブステップ 2、PD 20 反復、s=10 まで）
+
+| ν | 反転要素数（FEM / PD） | 最小 det F | s=2 の反力（FEM / PD） | s=10 の反力（FEM / PD） |
+|---|---|---|---|---|
+| 0 | 0 / 0 | 1.000 | 87992 / 87992 | 519744 / 519745 |
+| 0.2 | 0 / 0 | 1.000 | 79298 / 79298 | 439485 / 439486 |
+| 0.3 | 0 / 0 | 0.727 | 76634 / 76634 | 410699 / 410690 |
+| 0.4 | 0 / 0 | 0.228 | 75149 / 75149 | 388896 / 388890 |
+| 0.45 | 0 / 0 | 0.126 | 75139 / 75139 | 381100 / 381108 |
+
+- **どの ν でも一度も反転しない**（corotational は ν=0.3 で s≈3.3 から反転し、s=10 で 424/512 要素が反転）。
+- FEM と PD は 5 桁以上一致する。
+- 反力は線形でなくなる（ν=0 でも s=10 で corotational の 9.0e5 に対し 5.2e5）。Neo-Hookean 自体の性質。
+- 折り畳んで反転させた初期状態からも、反転 0 に戻る（`test/neohookean.test.js`）。
+- 計算コストは corotational より高い。梁（40×8）で FEM は Newton 約 3.4 回/ステップ、CG 約 200 反復/回で、corotational FEM の約 3〜4 倍。PD の L-BFGS は corotational PD と同程度（約 1〜1.5 ms）。
 
 ## 疎 Cholesky の性能（Chrome、PD 10 反復/ステップ）
 
@@ -117,4 +157,6 @@ CG は大きいメッシュで最大反復（既定 300）に達し未収束で�
 
 - 疎 Cholesky の並べ替えは RCM のみ（AMD に替えれば fill-in はさらに減る。`rcm()` を差し替えるだけ）。
 - 線形三角形（CST）なので粗い厚み方向分割では曲げに対して硬くなる（せん断ロッキング）。
-- 要素反転への特別な対応はなし。
+- Corotational 材料には要素反転への特別な対応はなし（反転に強いのは Stable Neo-Hookean を選んだとき）。
+- Neo-Hookean は 2D 平面ひずみの Stable 型のみ（`ln J` 型の古典 Neo-Hookean は未実装）。PD の定数行列は `w = 2μ+2λ` のまま使うので、変形が大きいと L-BFGS の反復は corotational PD より多く要る。
+- Neo-Hookean では `L-BFGS history`（PD）を 0 にしても履歴 1 で動く（plain PD は使えない）。

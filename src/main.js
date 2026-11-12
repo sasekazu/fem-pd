@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import GUI from 'lil-gui';
 import { createRectMesh, createDiscMesh } from './mesh.js';
 import { CorotationalFEM } from './sim/corotationalFEM.js';
+import { HyperelasticFEM } from './sim/hyperelasticFEM.js';
 import { ProjectiveDynamics } from './sim/projectiveDynamics.js';
 import { DEFAULT_PARAMS } from './sim/base.js';
 import { SoftBodyView, fitCamera } from './render.js';
@@ -72,8 +73,25 @@ let y0 = 0; // initial centre-of-mass height (ball scene)
 let cameraRect = null; // smoothed shared view rectangle (stretch scene)
 
 function materialParams() {
-  const { E, nu, density, gravity, damping } = settings;
-  return { E, nu, density, gravity, damping };
+  const { model, E, nu, density, gravity, damping } = settings;
+  return { model, E, nu, density, gravity, damping };
+}
+const isNeo = () => settings.model === 'neohookean';
+
+/** Panel headings follow the selected material model. */
+function updateLabels() {
+  const set = (id, text) => (document.getElementById(id).textContent = text);
+  if (isNeo()) {
+    set('title-fem', 'Stable Neo-Hookean FEM');
+    set('sub-fem', 'implicit Euler, Newton, PSD-projected Hessian, CG');
+    set('title-pd', 'Stable Neo-Hookean PD + L-BFGS');
+    set('sub-pd', 'constant PD matrix (Cholesky) as L-BFGS preconditioner');
+  } else {
+    set('title-fem', 'Corotational FEM');
+    set('sub-fem', 'implicit Euler, warped stiffness, CG');
+    set('title-pd', 'Projective Dynamics');
+    set('sub-pd', 'local/global, pre-factored Cholesky');
+  }
 }
 const contactParams = () => ({ enabled: settings.floor, floorY: settings.floorY, k: settings.contactK });
 
@@ -126,7 +144,7 @@ function build() {
   mesh = ball
     ? createDiscMesh(BALL_RADIUS, settings.rings, [0, settings.floorY + BALL_RADIUS + settings.gap])
     : createRectMesh(SCENES[settings.scene].width, SCENES[settings.scene].height, settings.nx, settings.ny);
-  fem = new CorotationalFEM(mesh, materialParams());
+  fem = isNeo() ? new HyperelasticFEM(mesh, materialParams()) : new CorotationalFEM(mesh, materialParams());
   pd = new ProjectiveDynamics(mesh, materialParams());
   fem.setContact(contactParams());
   pd.setContact(contactParams());
@@ -149,6 +167,7 @@ function build() {
   document.documentElement.style.setProperty('--plot-h', stretch ? `${PLOT_H}px` : '0px');
   resize();
   updateLegend();
+  updateLabels();
 }
 
 function applySolverSettings() {
@@ -200,6 +219,10 @@ gui
   });
 
 const fMat = gui.addFolder('Material / world');
+fMat
+  .add(settings, 'model', { Corotational: 'corotational', 'Stable Neo-Hookean': 'neohookean' })
+  .name('material model')
+  .onChange(build);
 fMat.add(settings, 'E', 1e5, 1e8, 1e5).name("Young's modulus E").onChange(pushParams);
 fMat.add(settings, 'nu', 0, 0.45, 0.01).name('Poisson ratio ν').onChange(pushParams);
 fMat.add(settings, 'density', 100, 5000, 10).name('density ρ').onChange(pushParams);
@@ -237,12 +260,12 @@ fContact
   .add(settings, 'contactK', { '1e5 (soft)': 1e5, '1e6': 1e6, '1e7': 1e7, '1e8 (hard)': 1e8 })
   .name('stiffness k [1/s²]')
   .onChange(pushContact);
-fContact.add(settings, 'lbfgs', 0, 12, 1).name('PD L-BFGS history').onChange(applySolverSettings);
+fContact.add(settings, 'lbfgs', 0, 12, 1).name('L-BFGS history (PD)').onChange(applySolverSettings);
 
 const fSim = gui.addFolder('Simulation');
 fSim.add(settings, 'dt', { '1/240 s': 1 / 240, '1/120 s': 1 / 120, '1/60 s': 1 / 60, '1/30 s': 1 / 30 }).name('time step dt');
 fSim.add(settings, 'substeps', 1, 8, 1).name('substeps');
-fSim.add(settings, 'pdIterations', 1, 100, 1).name('PD iterations').onChange(applySolverSettings);
+fSim.add(settings, 'pdIterations', 1, 100, 1).name('PD / L-BFGS iterations').onChange(applySolverSettings);
 fSim.add(settings, 'cgMaxIter', 5, 1000, 1).name('CG max iter').onChange(applySolverSettings);
 fSim.add(settings, 'cgTol', [1e-3, 1e-4, 1e-6, 1e-8]).name('CG tolerance').onChange(applySolverSettings);
 fSim.add(settings, 'timeScale', 0.1, 2, 0.1).name('time scale');
@@ -307,7 +330,8 @@ function statsText(sim, ms, tr, labelIt) {
   const scene = settings.scene;
   const row = (k, v) => `${k.padEnd(11)} ${String(v).padStart(9)}\n`;
   let s = row('step time', `${ms.toFixed(2)} ms`) + row(labelIt, sim.stats.iterations);
-  if (sim.stats.lineSearch !== undefined && settings.floor) s += row('backtracks', sim.stats.lineSearch);
+  if (sim.stats.cgIterations !== undefined) s += row('CG iters', sim.stats.cgIterations);
+  if (sim.stats.lineSearch !== undefined && (settings.floor || isNeo())) s += row('backtracks', sim.stats.lineSearch);
   if (scene === 'ball') {
     const yRest = settings.floorY + BALL_RADIUS;
     s += row('centre y', sim.centerOfMass().y.toFixed(4));
@@ -332,8 +356,8 @@ function statsText(sim, ms, tr, labelIt) {
 function updateStats(now) {
   if (now - lastStatsUpdate < 100) return;
   lastStatsUpdate = now;
-  elFem.textContent = statsText(fem, smoothing.fem ?? 0, track.fem, 'CG iters');
-  elPd.textContent = statsText(pd, smoothing.pd ?? 0, track.pd, 'PD iters');
+  elFem.textContent = statsText(fem, smoothing.fem ?? 0, track.fem, isNeo() ? 'Newton iters' : 'CG iters');
+  elPd.textContent = statsText(pd, smoothing.pd ?? 0, track.pd, isNeo() ? 'L-BFGS iters' : 'PD iters');
 }
 
 /** Shared camera rectangle that keeps both deforming bodies in view (stretch scene). */

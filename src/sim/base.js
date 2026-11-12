@@ -1,6 +1,10 @@
 import { lame, polarRotation } from '../math2d.js';
+import { snhEnergy, snhPK1 } from '../materials.js';
+
+export const MODELS = ['corotational', 'neohookean'];
 
 export const DEFAULT_PARAMS = {
+  model: 'corotational', // constitutive model: 'corotational' | 'neohookean' (Stable Neo-Hookean)
   E: 5e6, // Young's modulus
   nu: 0.3, // Poisson ratio
   density: 1000, // mass per unit area (thickness = 1)
@@ -37,6 +41,11 @@ export class SoftBodyBase {
     const { mu, lambda } = lame(E, nu);
     this.mu = mu;
     this.lambda = lambda;
+    // Stable Neo-Hookean parameter: the (J-1)^2 term of Psi_SNH is paired with -mu (J-1), which
+    // lowers the rest bulk stiffness by mu. lambda + mu restores it, so that the rest Hessian equals
+    // linear elasticity with the Lame parameters (mu, lambda) (2D analogue of Smith et al.'s
+    // mu' = 4/3 mu, lambda' = lambda + 5/6 mu).
+    this.lambdaNH = lambda + mu;
     // lumped mass: a third of each incident triangle's mass
     const { tris, area } = this.mesh;
     const mass = new Float64Array(this.n);
@@ -73,10 +82,19 @@ export class SoftBodyBase {
     return e;
   }
 
-  /** Exact corotational energy  sum_e area (mu ||F-R||^2 + lambda/2 (tr(R^T F) - 2)^2). */
+  get isNeoHookean() {
+    return this.params.model === 'neohookean';
+  }
+
+  /**
+   * Exact elastic energy. Corotational: sum_e area (mu ||F-R||^2 + lambda/2 (tr(R^T F) - 2)^2).
+   * Stable Neo-Hookean: sum_e area Psi_SNH(F).
+   */
   elasticEnergy(x) {
     const { tris, Dinv, area } = this.mesh;
-    const { mu, lambda } = this;
+    const { mu } = this;
+    const lambda = this.isNeoHookean ? this.lambdaNH : this.lambda;
+    const neo = this.isNeoHookean;
     const rot = [1, 0];
     let e = 0;
     for (let t = 0; t < area.length; t++) {
@@ -95,6 +113,10 @@ export class SoftBodyBase {
       const f01 = d1x * b + d2x * d;
       const f10 = d1y * a + d2y * c;
       const f11 = d1y * b + d2y * d;
+      if (neo) {
+        e += area[t] * snhEnergy(mu, lambda, f00, f01, f10, f11);
+        continue;
+      }
       polarRotation(f00, f01, f10, f11, rot);
       const cs = rot[0];
       const sn = rot[1];
@@ -107,14 +129,17 @@ export class SoftBodyBase {
 
 
   /**
-   * Exact corotational internal force at positions x (negative energy gradient with R held at its
-   * polar value, which is the exact gradient): f_{a,k} = -area sum_c P_{kc} G_{ca},
-   * P = 2 mu (F - R) + lambda (tr(R^T F) - 2) R. Independent of the solver.
+   * Exact internal force at positions x (negative energy gradient): f_{a,k} = -area sum_c P_{kc} G_{ca}.
+   * Corotational: P = 2 mu (F - R) + lambda (tr(R^T F) - 2) R (R held at its polar value, which is
+   * the exact gradient). Stable Neo-Hookean: P = mu F + (lambda (J-1) - mu) cof F. Independent of the solver.
    */
   internalForces(x, out) {
     const { tris, Dinv, area } = this.mesh;
-    const { mu, lambda } = this;
+    const { mu } = this;
+    const lambda = this.isNeoHookean ? this.lambdaNH : this.lambda;
+    const neo = this.isNeoHookean;
     const rot = [1, 0];
+    const pk = new Float64Array(4);
     out.fill(0);
     for (let t = 0; t < area.length; t++) {
       const i0 = tris[3 * t];
@@ -132,14 +157,23 @@ export class SoftBodyBase {
       const f01 = d1x * b + d2x * d;
       const f10 = d1y * a + d2y * c;
       const f11 = d1y * b + d2y * d;
-      polarRotation(f00, f01, f10, f11, rot);
-      const cs = rot[0];
-      const sn = rot[1];
-      const tr = cs * (f00 + f11) + sn * (f10 - f01) - 2;
-      const p00 = 2 * mu * (f00 - cs) + lambda * tr * cs;
-      const p01 = 2 * mu * (f01 + sn) - lambda * tr * sn;
-      const p10 = 2 * mu * (f10 - sn) + lambda * tr * sn;
-      const p11 = 2 * mu * (f11 - cs) + lambda * tr * cs;
+      let p00;
+      let p01;
+      let p10;
+      let p11;
+      if (neo) {
+        snhPK1(mu, lambda, f00, f01, f10, f11, pk);
+        [p00, p01, p10, p11] = pk;
+      } else {
+        polarRotation(f00, f01, f10, f11, rot);
+        const cs = rot[0];
+        const sn = rot[1];
+        const tr = cs * (f00 + f11) + sn * (f10 - f01) - 2;
+        p00 = 2 * mu * (f00 - cs) + lambda * tr * cs;
+        p01 = 2 * mu * (f01 + sn) - lambda * tr * sn;
+        p10 = 2 * mu * (f10 - sn) + lambda * tr * sn;
+        p11 = 2 * mu * (f11 - cs) + lambda * tr * cs;
+      }
       // shape-function gradients: g1 = (a, b), g2 = (c, d), g0 = -(g1 + g2)
       const gs = [-(a + c), -(b + d), a, b, c, d];
       const A = area[t];

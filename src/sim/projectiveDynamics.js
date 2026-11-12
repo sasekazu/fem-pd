@@ -1,9 +1,15 @@
 import { SparseCholesky } from '../sparse/cholesky.js';
 import { SoftBodyBase } from './base.js';
 import { polarRotation } from '../math2d.js';
+import { snhPK1 } from '../materials.js';
 
 /**
  * Projective Dynamics (Bouaziz et al. 2014), local/global solver.
+ *
+ * Stable Neo-Hookean (params.model === 'neohookean') is not a sum of quadratic projections, so the
+ * local/global iteration cannot represent it. In that case the same constant PD matrix is used as
+ * the initial inverse Hessian of L-BFGS on the exact SNH objective (Liu et al. 2017, "Quasi-Newton
+ * methods for real-time simulation of hyperelastic materials"); see `_solveLBFGS`.
  *
  * Per triangle two strain terms share the deformation gradient F = Ds Dm^-1 (R = polar rotation of F):
  *   ARAP     energy (w_a/2)||F - R||^2                  w_a = 2 mu      target R
@@ -31,6 +37,7 @@ export class ProjectiveDynamics extends SoftBodyBase {
     this._xt = new Float64Array(2 * n);
     this._tg = [1, 0, 0, 1];
     this._rot = [1, 0];
+    this._pk = new Float64Array(4);
     this.lbfgsM = 6; // L-BFGS history used when floor contact is enabled (0 = plain PD + line search)
     this._G = this._buildGradients();
   }
@@ -184,6 +191,10 @@ export class ProjectiveDynamics extends SoftBodyBase {
     const G = this._G;
     const w = 2 * this.mu + 2 * this.lambda;
     const tg = this._tg;
+    const neo = this.isNeoHookean;
+    const lamNH = this.lambdaNH;
+    const mu = this.mu;
+    const pk = this._pk;
     const { enabled, floorY, k } = this.contact;
     g.fill(0);
     for (let i = 0; i < n; i++) {
@@ -209,6 +220,18 @@ export class ProjectiveDynamics extends SoftBodyBase {
       const f01 = d1x * G[o + 3] + d2x * G[o + 5];
       const f10 = d1y * G[o + 2] + d2y * G[o + 4];
       const f11 = d1y * G[o + 3] + d2y * G[o + 5];
+      if (neo) {
+        // exact SNH gradient: area * P G (P = first Piola-Kirchhoff stress)
+        snhPK1(mu, lamNH, f00, f01, f10, f11, pk);
+        const A = area[e];
+        for (let a = 0; a < 3; a++) {
+          const fa = fidx[tris[3 * e + a]];
+          if (fa < 0) continue;
+          g[fa] += A * (G[o + 2 * a] * pk[0] + G[o + 2 * a + 1] * pk[1]);
+          g[nf + fa] += A * (G[o + 2 * a] * pk[2] + G[o + 2 * a + 1] * pk[3]);
+        }
+        continue;
+      }
       this._target(f00, f01, f10, f11, tg);
       const we = w * area[e];
       const r00 = f00 - tg[0];
@@ -242,7 +265,8 @@ export class ProjectiveDynamics extends SoftBodyBase {
     const { n } = this;
     const nf = this._nf;
     const fidx = this._fidx;
-    const m = this.lbfgsM;
+    // plain PD cannot represent Neo-Hookean: it always runs through L-BFGS (history >= 1)
+    const m = this.isNeoHookean ? Math.max(1, this.lbfgsM) : this.lbfgsM;
     const dim = 2 * nf;
     if (!this._lb || this._lb.dim !== dim || this._lb.m !== m) {
       const mk = () => new Float64Array(dim);
@@ -344,7 +368,7 @@ export class ProjectiveDynamics extends SoftBodyBase {
     return backtracks;
   }
 
-  /** Implicit-Euler objective: inertia + corotational elasticity + floor penalty. */
+  /** Implicit-Euler objective: inertia + elastic energy (corotational or Stable NH) + floor penalty. */
   _objective(x, y, h2) {
     const { mass, n } = this;
     let e = 0;
@@ -396,7 +420,7 @@ export class ProjectiveDynamics extends SoftBodyBase {
 
     const { enabled: contactOn, floorY, k: kc } = this.contact;
     let lineSearchSteps = 0;
-    const useLBFGS = contactOn && this.lbfgsM > 0;
+    const useLBFGS = this.isNeoHookean || (contactOn && this.lbfgsM > 0);
     if (useLBFGS) {
       // energy scale of the step (objective at x_n): used for convergence / round-off tolerances
       let eRef = 0;
