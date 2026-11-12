@@ -1,5 +1,6 @@
 // Rigid colliders described by a signed distance function (SDF), in world space.
 //
+// Colliders: HalfPlane (floor / walls), Polygon (any simple polygon), Circle.
 // A collider answers  query(px, py, out) -> phi  with the signed distance phi of the point to the
 // surface (phi < 0: inside the rigid body) and writes the unit gradient (outward normal) to
 // out[0], out[1]. Colliders are kinematic: their pose is set from outside (setPose) and is
@@ -158,6 +159,70 @@ export class Polygon {
   /** Is the world point inside the polygon? */
   contains(px, py) {
     return this.query(px, py, [0, 0]) < 0;
+  }
+
+  /** Lowest point of the body relative to its origin when rotated by `angle` (y direction). */
+  lowest(angle = this.angle) {
+    const c = Math.cos(angle);
+    const sn = Math.sin(angle);
+    let low = Infinity;
+    for (let i = 0; i < this.n; i++) low = Math.min(low, sn * this.vertices[2 * i] + c * this.vertices[2 * i + 1]);
+    return low;
+  }
+}
+
+/**
+ * Disc of radius r with a rigid pose (x, y). phi = |p - c| - r, grad(phi) = (p - c) / |p - c|
+ * (at the exact centre, where it is undefined, (0, 1) is used). `angle` is stored for API symmetry
+ * with Polygon (a disc looks the same when rotated).
+ */
+export class Circle {
+  constructor(radius, pose = {}) {
+    if (!(radius > 0)) throw new Error('Circle needs a positive radius');
+    this.radius = radius;
+    this.area = Math.PI * radius * radius;
+    this._bounds = [0, 0, 0, 0];
+    this.setPose(pose.x ?? 0, pose.y ?? 0, pose.angle ?? 0);
+  }
+
+  setPose(x, y, angle = this.angle) {
+    this.x = x;
+    this.y = y;
+    this.angle = angle;
+    const b = this._bounds;
+    b[0] = x - this.radius;
+    b[1] = y - this.radius;
+    b[2] = x + this.radius;
+    b[3] = y + this.radius;
+    return this;
+  }
+
+  bounds() {
+    return this._bounds;
+  }
+
+  query(px, py, out) {
+    const dx = px - this.x;
+    const dy = py - this.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 1e-12) {
+      out[0] = 0;
+      out[1] = 1;
+    } else {
+      out[0] = dx / d;
+      out[1] = dy / d;
+    }
+    return d - this.radius;
+  }
+
+  /** Is the world point inside the disc? */
+  contains(px, py) {
+    return Math.hypot(px - this.x, py - this.y) < this.radius;
+  }
+
+  /** Lowest point of the body relative to its origin when rotated by `angle` (y direction). */
+  lowest() {
+    return -this.radius;
   }
 }
 

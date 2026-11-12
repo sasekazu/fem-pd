@@ -8,7 +8,7 @@ import { SoftBodyView, fitCamera } from './render.js';
 import { StretchDriver } from './stretch.js';
 import { LinePlot } from './plot.js';
 import { MouseGrabber, viewportToWorld } from './interaction.js';
-import { Polygon, boxVertices, regularVertices, starVertices, lShapeVertices } from './rigid.js';
+import { Polygon, Circle, boxVertices, regularVertices, starVertices, lShapeVertices } from './rigid.js';
 
 const canvas = document.getElementById('canvas');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -47,12 +47,13 @@ const SCENES = {
   },
 };
 
-// Kinematic rigid shapes (body frame, lengths in m).
+// Kinematic rigid shapes (lengths in m); each factory returns a collider (see rigid.js).
 const RIGID_SHAPES = {
-  wedge: () => regularVertices(3, 0.5, -Math.PI / 2), // sharp tip pointing down
-  box: () => boxVertices(0.9, 0.5),
-  star: () => starVertices(5, 0.55, 0.24, -Math.PI / 2),
-  'L-shape (concave)': () => lShapeVertices(0.9, 0.8, 0.45, 0.4),
+  wedge: () => new Polygon(regularVertices(3, 0.5, -Math.PI / 2)), // sharp tip pointing down
+  box: () => new Polygon(boxVertices(0.9, 0.5)),
+  star: () => new Polygon(starVertices(5, 0.55, 0.24, -Math.PI / 2)),
+  'L-shape (concave)': () => new Polygon(lShapeVertices(0.9, 0.8, 0.45, 0.4)),
+  circle: () => new Circle(0.4),
 };
 const RIGID_CLEARANCE = 0.25; // gap between the lowest point of the rigid body and the block top at its home pose
 const RIGID_MAX_SPEED = 2; // [m/s] kinematic body follows its target at most this fast (avoids tunnelling)
@@ -100,7 +101,7 @@ let stepRequest = 0;
 const smoothing = { fem: null, pd: null };
 const track = { fem: null, pd: null };
 let y0 = 0; // initial centre-of-mass height (ball scene)
-let rigidBody = null; // Polygon collider shared by both solvers (rigid scene)
+let rigidBody = null; // Polygon / Circle collider shared by both solvers (rigid scene)
 const rigid = { x: 0, y: 0, angle: 0, tx: 0, ty: 0, tAngle: 0, time: 0, drag: null, lowest: 0, topY: 0 };
 let cameraRect = null; // smoothed shared view rectangle (stretch scene)
 
@@ -170,7 +171,7 @@ function build() {
   pd = new ProjectiveDynamics(mesh, materialParams());
   fem.setContact(contactParams());
   pd.setContact(contactParams());
-  rigidBody = hasRigid ? new Polygon(RIGID_SHAPES[settings.rigidShape]()) : null;
+  rigidBody = hasRigid ? RIGID_SHAPES[settings.rigidShape]() : null;
   fem.setColliders(rigidBody ? [rigidBody] : []);
   pd.setColliders(rigidBody ? [rigidBody] : []);
   if (rigidBody) {
@@ -228,18 +229,9 @@ function pushContact() {
 }
 
 // ---- kinematic rigid body: scripted press and/or mouse drag, speed-limited ----
-/** Lowest point of the body (body frame rotated by `angle`) relative to its origin. */
-function rigidLowest(angle) {
-  const c = Math.cos(angle);
-  const s = Math.sin(angle);
-  let low = Infinity;
-  for (let i = 0; i < rigidBody.n; i++) low = Math.min(low, s * rigidBody.vertices[2 * i] + c * rigidBody.vertices[2 * i + 1]);
-  return low;
-}
-
 /** y of the body origin when its lowest point is `depth` below the block top (negative depth: above). */
 function rigidYAt(depth, angle) {
-  return rigid.topY - depth - rigidLowest(angle);
+  return rigid.topY - depth - rigidBody.lowest(angle);
 }
 
 function resetRigid() {

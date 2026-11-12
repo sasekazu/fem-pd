@@ -4,7 +4,7 @@ import { createBlockMesh, createDiscMesh } from '../src/mesh.js';
 import { CorotationalFEM } from '../src/sim/corotationalFEM.js';
 import { ProjectiveDynamics } from '../src/sim/projectiveDynamics.js';
 import { ContactModel } from '../src/contact.js';
-import { HalfPlane, Polygon, boxVertices, regularVertices, starVertices, lShapeVertices } from '../src/rigid.js';
+import { HalfPlane, Polygon, Circle, boxVertices, regularVertices, starVertices, lShapeVertices } from '../src/rigid.js';
 
 const close = (a, b, tol, msg) => assert.ok(Math.abs(a - b) <= tol, `${msg ?? ''} ${a} vs ${b} (tol ${tol})`);
 
@@ -60,6 +60,47 @@ test('Polygon: clockwise input is reordered, area is right', () => {
   assert.throws(() => new Polygon([0, 0, 1, 1]));
 });
 
+test('Circle: signed distance, normal, bounds, pose, lowest point', () => {
+  const c = new Circle(0.5, { x: 1, y: 2 });
+  close(c.query(1, 2.3, q), -0.2, 1e-14, 'inside');
+  close(q[0], 0, 1e-14);
+  close(q[1], 1, 1e-14);
+  close(c.query(4, 6, q), 5 - 0.5, 1e-14, 'outside');
+  close(q[0], 0.6, 1e-14);
+  close(q[1], 0.8, 1e-14);
+  close(c.query(1, 2, q), -0.5, 1e-14, 'at the centre');
+  close(Math.hypot(q[0], q[1]), 1, 1e-14);
+  assert.deepEqual(c.bounds(), [0.5, 1.5, 1.5, 2.5]);
+  assert.ok(c.contains(1.3, 2.3) && !c.contains(1.4, 2.4));
+  close(c.lowest(), -0.5, 0);
+  c.setPose(-1, 0.25);
+  close(c.query(-1, 0.25 - 0.5, q), 0, 1e-14, 'on the surface');
+  assert.deepEqual(c.bounds(), [-1.5, -0.25, -0.5, 0.75]);
+  assert.throws(() => new Circle(0));
+  // Polygon.lowest agrees with the vertices of a rotated body
+  const wedge = new Polygon(regularVertices(3, 0.5, -Math.PI / 2));
+  close(wedge.lowest(0), -0.5, 1e-14);
+  close(wedge.lowest(Math.PI), -0.5 * Math.cos(Math.PI / 3), 1e-14);
+});
+
+test('Circle: |grad phi| = 1 and finite-difference gradient', () => {
+  const c = new Circle(0.7, { x: 0.2, y: -0.1 });
+  const r = rng(3);
+  const e = 1e-7;
+  for (let k = 0; k < 200; k++) {
+    const px = 2 * r();
+    const py = 2 * r();
+    c.query(px, py, q);
+    const nx = q[0];
+    const ny = q[1];
+    close(Math.hypot(nx, ny), 1, 1e-12);
+    const gx = (c.query(px + e, py, q) - c.query(px - e, py, q)) / (2 * e);
+    const gy = (c.query(px, py + e, q) - c.query(px, py - e, q)) / (2 * e);
+    close(gx, nx, 1e-6);
+    close(gy, ny, 1e-6);
+  }
+});
+
 test('Polygon (concave L-shape): notch is outside, distances to both notch faces', () => {
   // 1 x 1 box centred at the origin with the upper right 0.5 x 0.5 corner removed
   const L = new Polygon(lShapeVertices(1, 1, 0.5, 0.5));
@@ -113,7 +154,8 @@ test('ContactModel: energy = 1/2 k sum m phi^2 and net force is -dE/d(translatio
   const s = new CorotationalFEM(mesh, { E: 1e6, nu: 0.3 });
   const star = new Polygon(starVertices(5, 0.7, 0.3, 0.4), { x: 0.1, y: 0.9, angle: 0.3 });
   s.setContact({ enabled: true, floorY: 0.6, k: 3e5 });
-  s.setColliders([star]);
+  const disc = new Circle(0.35, { x: -0.3, y: 1.3 }); // overlaps the upper left of the ball
+  s.setColliders([star, disc]);
   const x = Float64Array.from(s.x);
   const ct = s.contact;
   let expect = 0;
@@ -126,29 +168,29 @@ test('ContactModel: energy = 1/2 k sum m phi^2 and net force is -dE/d(translatio
   close(s.contactEnergy(x), expect, 1e-10 * expect);
   // the net force on the soft body equals -dE/d(uniform translation)
   const forces = ct.colliderForces(x, s.mass, s.n);
-  assert.equal(forces.length, 2);
-  assert.ok(forces[0].count > 0 && forces[1].count > 0);
+  assert.equal(forces.length, 3);
+  assert.ok(forces[0].count > 0 && forces[1].count > 0 && forces[2].count > 0);
   const tr = (dx, dy) => {
     const xt = Float64Array.from(x, (v, i) => v + (i % 2 ? dy : dx));
     return s.contactEnergy(xt);
   };
   const eps = 1e-7;
-  const fx = forces[0].fx + forces[1].fx;
-  const fy = forces[0].fy + forces[1].fy;
+  const fx = forces.reduce((a, f) => a + f.fx, 0);
+  const fy = forces.reduce((a, f) => a + f.fy, 0);
   close(-(tr(eps, 0) - tr(-eps, 0)) / (2 * eps), fx, 1e-5 * Math.abs(fx) + 1e-6, 'fx');
   close(-(tr(0, eps) - tr(0, -eps)) / (2 * eps), fy, 1e-5 * Math.abs(fy) + 1e-6, 'fy');
   // the floor alone pushes up, the star pushes the ball away from itself
   assert.ok(forces[0].fy > 0);
   s.setContact({ enabled: false });
-  close(ct.colliders().length, 1, 0);
+  assert.equal(ct.colliders().length, 2); // the star and the disc remain
   assert.ok(s.contactEnergy(x) < expect);
 });
 
-test('PD gradient matches finite differences of the objective (rotated star + floor)', () => {
+test('PD gradient matches finite differences of the objective (rotated star + circle + floor)', () => {
   const mesh = createDiscMesh(0.5, 3, [0, 0.9]);
   const s = new ProjectiveDynamics(mesh, { E: 1e6, nu: 0.3, density: 1000, damping: 0 });
   s.setContact({ enabled: true, floorY: 0.5, k: 1e6 });
-  s.setColliders([new Polygon(starVertices(5, 0.8, 0.35, 0.2), { x: 0.05, y: 0.85, angle: 0.4 })]);
+  s.setColliders([new Polygon(starVertices(5, 0.8, 0.35, 0.2), { x: 0.05, y: 0.85, angle: 0.4 }), new Circle(0.3, { x: 0.35, y: 1.25 })]);
   s.step(1 / 240); // builds the factorisation
   const h2 = (1 / 240) ** 2;
   const r = rng(5);
@@ -182,8 +224,8 @@ const MAT = { E: 1e6, nu: 0.3, density: 1000, damping: 0.5 };
 const H = 1 / 240;
 
 /** Block 1 x 0.6 on the floor y = 0, rigid body lowered from `y0` to `y1` (origin height) at 0.1 m/s, then held. */
-function press(S, body, y0, y1, { hold = 1.5, k = 1e7, iterations = 30 } = {}) {
-  const mesh = createBlockMesh(1, 0.6, 14, 8, [0, 0]);
+function press(S, body, y0, y1, { hold = 1.5, k = 1e7, iterations = 30, pinBottom = false } = {}) {
+  const mesh = createBlockMesh(1, 0.6, 14, 8, [0, 0], pinBottom);
   const s = new S(mesh, MAT);
   if (S === ProjectiveDynamics) s.iterations = iterations;
   s.setContact({ enabled: true, floorY: 0, k });
@@ -284,6 +326,22 @@ test('createBlockMesh: pinBottom pins exactly the bottom row; pinned block stays
   let dmax = 0;
   for (let i = 0; i < a.x.length; i++) dmax = Math.max(dmax, Math.abs(a.x[i] - b.x[i]));
   assert.ok(dmax < 0.01, `max vertex difference ${dmax}`);
+});
+
+test('FEM and PD agree on a disc pressed into a block (bottom pinned)', () => {
+  // Bottom pinned: on a free block a round indenter squeezes the block out sideways (frictionless floor).
+  const mk = () => new Circle(0.3, { x: 0.02, y: 0.6 + 0.3 + 0.2 });
+  const a = press(CorotationalFEM, mk(), 1.1, 0.8, { pinBottom: true }).s; // disc bottom 0.8 -> 0.5 (block top 0.6)
+  const b = press(ProjectiveDynamics, mk(), 1.1, 0.8, { pinBottom: true }).s;
+  const fa = a.contact.colliderForces(a.x, a.mass, a.n)[1];
+  const fb = b.contact.colliderForces(b.x, b.mass, b.n)[1];
+  console.log(`  disc press force  FEM=${-fa.fy.toFixed(0)}  PD=${-fb.fy.toFixed(0)}`);
+  assert.ok(-fa.fy > 1e4 && fa.count >= 3, `press ${-fa.fy}, contacts ${fa.count}`);
+  close(fa.fy, fb.fy, 0.02 * Math.abs(fa.fy), 'press force');
+  close(fa.fx, fb.fx, 0.02 * Math.abs(fa.fy), 'lateral force');
+  assert.ok(a.contact.maxPenetration(a.x, a.n, 1) < 0.01);
+  assert.equal(a.deformationStats().inverted, 0);
+  assert.equal(b.deformationStats().inverted, 0);
 });
 
 test('PD without L-BFGS (plain local/global + line search) gives the same wedge press', () => {

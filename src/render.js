@@ -93,7 +93,7 @@ export class SoftBodyView {
     this.rigid = [];
   }
 
-  /** Show the given Polygon colliders (replaces the previous ones). Their pose is read every update(). */
+  /** Show the given Polygon / Circle colliders (replaces the previous ones). Their pose is read every update(). */
   setRigid(bodies) {
     for (const r of this.rigid) {
       this.rigidGroup.remove(r.group);
@@ -103,20 +103,38 @@ export class SoftBodyView {
       });
     }
     this.rigid = bodies.map((body) => {
-      const v = body.vertices;
-      const shape = new THREE.Shape();
-      shape.moveTo(v[0], v[1]);
-      for (let i = 1; i < body.n; i++) shape.lineTo(v[2 * i], v[2 * i + 1]);
-      shape.closePath();
+      let geometry;
+      const pts = [];
+      if (body.radius !== undefined) {
+        // disc: filled circle plus an outline with a radius mark so that rotation stays visible
+        geometry = new THREE.CircleGeometry(body.radius, 64);
+        for (let i = 0; i < 64; i++) {
+          const a = (2 * Math.PI * i) / 64;
+          pts.push(new THREE.Vector3(body.radius * Math.cos(a), body.radius * Math.sin(a), 0.001));
+        }
+      } else {
+        const v = body.vertices;
+        const shape = new THREE.Shape();
+        shape.moveTo(v[0], v[1]);
+        for (let i = 1; i < body.n; i++) shape.lineTo(v[2 * i], v[2 * i + 1]);
+        shape.closePath();
+        geometry = new THREE.ShapeGeometry(shape);
+        for (let i = 0; i < body.n; i++) pts.push(new THREE.Vector3(v[2 * i], v[2 * i + 1], 0.001));
+      }
       const fill = new THREE.Mesh(
-        new THREE.ShapeGeometry(shape),
+        geometry,
         new THREE.MeshBasicMaterial({ color: 0x66758f, transparent: true, opacity: 0.82, side: THREE.DoubleSide })
       );
-      const pts = [];
-      for (let i = 0; i < body.n; i++) pts.push(new THREE.Vector3(v[2 * i], v[2 * i + 1], 0.001));
       const outline = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xd3dcec }));
       const group = new THREE.Group();
       group.add(fill, outline);
+      if (body.radius !== undefined) {
+        const mark = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0.002), new THREE.Vector3(body.radius, 0, 0.002)]),
+          new THREE.LineBasicMaterial({ color: 0xd3dcec })
+        );
+        group.add(mark);
+      }
       this.rigidGroup.add(group);
       return { body, group };
     });
