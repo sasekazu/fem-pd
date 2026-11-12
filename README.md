@@ -5,8 +5,11 @@
 
 ## 起動
 
+公開版: <https://sasekazu.github.io/fem-pd/>
+
+手元で動かす場合（three / lil-gui は CDN から読み込むのでネット接続が必要）:
+
 ```bash
-npm install          # three / lil-gui（と、テスト用の ml-matrix）を取得（初回のみ）
 npm start            # python -m http.server 8000
 ```
 
@@ -15,6 +18,7 @@ npm start            # python -m http.server 8000
 ## テスト
 
 ```bash
+npm install          # テスト用の ml-matrix を取得（初回のみ）
 npm test             # node --test（数値コアの単体テスト + 静的たわみの FEM/PD/梁理論の一致 + 疎 Cholesky の検証）
 ```
 

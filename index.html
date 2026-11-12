@@ -25,12 +25,13 @@
     #legend { position: fixed; left: 14px; bottom: calc(10px + var(--plot-h)); font-size: 12px; color: #93a0b4; display: flex; gap: 8px; align-items: center; }
     #legend .bar { width: 120px; height: 10px; border-radius: 2px; background: linear-gradient(90deg, #8cbff2, #f2c14e, #e8452f); }
   </style>
-  <!-- Libraries are installed with `npm install` and resolved locally (no build step). -->
+  <!-- Libraries are loaded from a CDN with pinned versions (no build step), so the page also works on GitHub Pages.
+       `npm install` is only needed for the unit tests. -->
   <script type="importmap">
   {
     "imports": {
-      "three": "./node_modules/three/build/three.module.js",
-      "lil-gui": "./node_modules/lil-gui/dist/lil-gui.esm.js"
+      "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
+      "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.21.0/dist/lil-gui.esm.js"
     }
   }
   </script>
