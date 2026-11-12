@@ -1,0 +1,19 @@
+{
+  "name": "fem-pd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "2D corotational FEM vs projective dynamics comparison",
+  "scripts": {
+    "start": "python -m http.server 8000",
+    "test": "node --test \"test/*.test.js\"",
+    "sweep": "node scripts/stretch_sweep.mjs"
+  },
+  "dependencies": {
+    "lil-gui": "0.21.0",
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "ml-matrix": "6.15.1"
+  }
+}
