@@ -52,6 +52,8 @@ const settings = {
   lbfgs: 6,
   pullSpeed: 0.5, // stretch test: grip speed per side [m/s]
   maxStretch: 10, // stretch test: final stretch ratio
+  testType: 'stretch', // 'stretch' (grips apart) | 'compress' (grips together)
+  minStretch: 0.3, // compression test: final width ratio
   dt: 1 / 60,
   substeps: 1,
   pdIterations: 10,
@@ -132,8 +134,9 @@ function samplePlots() {
   if (!driver) return;
   const rf = fem.gripForce(mesh.rightIdx, +1);
   const rp = pd.gripForce(mesh.rightIdx, +1);
-  plotForce.push(driver.stretch, rf, rp);
-  plotDet.push(driver.stretch, fem.deformationStats().minDet, pd.deformationStats().minDet);
+  const s = driver.currentStretch(fem); // actual ratio (differs from the prescribed one after release)
+  plotForce.push(s, rf, rp);
+  plotDet.push(s, fem.deformationStats().minDet, pd.deformationStats().minDet);
 }
 
 function build() {
@@ -151,7 +154,12 @@ function build() {
   applySolverSettings();
   driver = null;
   if (stretch) {
-    driver = new StretchDriver(mesh, { speed: settings.pullSpeed, maxStretch: settings.maxStretch });
+    driver = new StretchDriver(mesh, {
+      speed: settings.pullSpeed,
+      maxStretch: settings.maxStretch,
+      compress: settings.testType === 'compress',
+      minStretch: settings.minStretch,
+    });
     driver.attach(fem, pd);
   }
   const rect = SCENES[settings.scene].view ?? { cx: 0.5, cy: 0, w: 3, h: 2 };
@@ -181,6 +189,8 @@ function applyStretchSettings() {
   if (!driver) return;
   driver.speed = settings.pullSpeed;
   driver.maxStretch = settings.maxStretch;
+  driver.minStretch = settings.minStretch;
+  if (driver.released) return;
   if (driver.mode === 'hold' && driver.d < driver.dMax) driver.mode = 'load';
   if (driver.d > driver.dMax) driver.d = driver.dMax;
 }
@@ -230,22 +240,42 @@ fMat.add(settings, 'gravity', 0, 30, 0.1).name('gravity g').onChange(pushParams)
 fMat.add(settings, 'damping', 0, 20, 0.1).name('damping [1/s]').onChange(pushParams);
 
 const fStretch = gui.addFolder('Stretch test');
+fStretch
+  .add(settings, 'testType', { 'Stretch (grips apart)': 'stretch', 'Compress (grips together)': 'compress' })
+  .name('test type')
+  .onChange(() => {
+    updateStretchControls();
+    build();
+  });
 fStretch.add(settings, 'pullSpeed', 0.05, 3, 0.05).name('grip speed / side [m/s]').onChange(applyStretchSettings);
-fStretch.add(settings, 'maxStretch', 1.5, 30, 0.5).name('max stretch ratio').onChange(applyStretchSettings);
+const cMaxStretch = fStretch.add(settings, 'maxStretch', 1.5, 30, 0.5).name('max stretch ratio').onChange(applyStretchSettings);
+const cMinStretch = fStretch.add(settings, 'minStretch', 0.05, 0.95, 0.05).name('min width ratio').onChange(applyStretchSettings);
+// Once released the grips are free: only "Reset" grabs them again.
 const stretchActions = {
   load() {
-    if (driver) driver.mode = driver.d < driver.dMax ? 'load' : 'hold';
+    if (driver && !driver.released) driver.mode = driver.d < driver.dMax ? 'load' : 'hold';
   },
   hold() {
-    if (driver) driver.mode = 'hold';
+    if (driver && !driver.released) driver.mode = 'hold';
   },
   unload() {
-    if (driver) driver.mode = 'unload';
+    if (driver && !driver.released) driver.mode = 'unload';
+  },
+  release() {
+    if (driver) driver.release(fem, pd);
   },
 };
 fStretch.add(stretchActions, 'load').name('▶ load');
 fStretch.add(stretchActions, 'hold').name('⏸ hold');
-fStretch.add(stretchActions, 'unload').name('◀ unload');
+fStretch.add(stretchActions, 'unload').name('◀ unload (slow)');
+fStretch.add(stretchActions, 'release').name('✂ release (snap back)');
+
+function updateStretchControls() {
+  const compress = settings.testType === 'compress';
+  compress ? cMaxStretch.hide() : cMaxStretch.show();
+  compress ? cMinStretch.show() : cMinStretch.hide();
+}
+updateStretchControls();
 
 const fContact = gui.addFolder('Floor contact (penalty)');
 fContact.add(settings, 'floor').name('floor').onChange(pushContact);
@@ -341,7 +371,8 @@ function statsText(sim, ms, tr, labelIt) {
     } else s += row('rebound', '-');
   } else if (scene === 'stretch') {
     const st = sim.deformationStats();
-    s += row('stretch s', `${driver.stretch.toFixed(2)} x`);
+    s += row('stretch s', `${driver.currentStretch(sim).toFixed(2)} x`);
+    s += row('grips', driver.released ? 'released' : driver.mode);
     s += row('grip force', sim.gripForce(mesh.rightIdx, +1).toExponential(3));
     s += row('min det F', st.minDet.toFixed(3));
     s += row('inverted', `${st.inverted} / ${mesh.area.length}`);
