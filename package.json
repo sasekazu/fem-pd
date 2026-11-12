@@ -15,5 +15,6 @@
   },
   "devDependencies": {
     "ml-matrix": "6.15.1"
-  }
+  },
+  "license": "MIT"
 }
